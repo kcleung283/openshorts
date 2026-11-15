@@ -24,6 +24,16 @@ Two invariants keep that chain from leaking:
 `target_clips` on `/api/process` (dashboard: advanced options) pins both ends via
 `CLIP_TARGET_MIN` / `CLIP_TARGET_MAX` when the user wants an exact number.
 
+`clip_brief` (dashboard: **Clip brief** under advanced options) or `CLIP_BRIEF` in
+`.env` is normalized by `clip_selection.clip_brief_from_request` and forwarded
+into `get_viral_clips` scoring and detail prompts via `editor_brief_block`.
+Vision-only silent footage does not read it yet.
+
+Self-host YouTube: a link with `?t=` downloads `SELF_HOST_SEGMENT_MINUTES` from
+that timestamp (`self_host_source.py`); the ranged file is not cut again from
+`SOURCE_START_SECONDS` (`main.py`). No manual segment file or API job is
+required — use Video URL in the dashboard, then edit clips in the UI.
+
 ## Silent footage: the vision fallback (`main.get_visual_clips`)
 
 `transcribe_video` raising `NoAudioError`, **or** `speech_is_sparse()` returning

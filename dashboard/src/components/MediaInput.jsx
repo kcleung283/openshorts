@@ -17,6 +17,23 @@ const MIN_SOURCE_SECONDS = 45;
 
 // Duration of a local video file in seconds, or null when the browser cannot
 // read it (unsupported codec): then the server stays the judge.
+/** Seconds offset from a YouTube ?t= / &t= param (self-host segment download). */
+function youtubeTimestampSeconds(rawUrl) {
+    try {
+        const u = new URL(rawUrl.trim());
+        const raw = u.searchParams.get('t') || u.searchParams.get('start');
+        if (!raw) return null;
+        if (/^\d+$/.test(raw)) return parseInt(raw, 10);
+        const m = raw.match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?/i);
+        if (!m) return null;
+        return (parseInt(m[1] || '0', 10) * 3600
+            + parseInt(m[2] || '0', 10) * 60
+            + parseInt(m[3] || '0', 10)) || null;
+    } catch {
+        return null;
+    }
+}
+
 const readVideoDuration = (file) => new Promise((resolve) => {
     try {
         const url = URL.createObjectURL(file);
@@ -32,6 +49,7 @@ const readVideoDuration = (file) => new Promise((resolve) => {
 
 export default function MediaInput({ onProcess, isProcessing }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
+    const [selfHostSegmentMin, setSelfHostSegmentMin] = useState(null);
     // File upload is the primary path; the link is secondary.
     const [mode, setMode] = useState('file'); // 'file' | 'url'
     const [url, setUrl] = useState('');
@@ -49,6 +67,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [targetClips, setTargetClips] = useState('');
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
+    const [clipBrief, setClipBrief] = useState(() => {
+        try { return localStorage.getItem('os_clip_brief') || ''; } catch { return ''; }
+    });
     // Auto-hook: burn the AI hook text into every clip. On by default; the
     // choice persists so turning it off sticks across sessions.
     const [autoHook, setAutoHook] = useState(() => {
@@ -98,6 +119,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     setYoutubeUrlEnabled(false);
                     setMode('file');
                 }
+                const seg = cfg?.selfHostYoutubeSegment?.minutes;
+                if (seg != null) setSelfHostSegmentMin(seg);
             })
             .catch(() => {});
     }, []);
@@ -127,6 +150,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             autoHook,
             autoHookStyle,
             layout,
+            clipBrief: clipBrief.trim() || null,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
         };
@@ -134,6 +158,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
+            localStorage.setItem('os_clip_brief', clipBrief);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
@@ -215,6 +240,33 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 )}
                             </div>
                         </div>
+                        {selfHostSegmentMin != null && url.trim() && (() => {
+                            const start = youtubeTimestampSeconds(url);
+                            if (start == null) {
+                                return (
+                                    <p className="text-xs text-muted leading-relaxed">
+                                        Self-host: plain links download at most{' '}
+                                        <span className="text-ink2">{Math.round(selfHostSegmentMin)} min</span> from the
+                                        start. For a live/VOD timestamp, add{' '}
+                                        <span className="font-mono text-ink2">?t=</span> (e.g.{' '}
+                                        <span className="font-mono text-ink2">?t=10589s</span>) — no pre-cut upload
+                                        needed; Ollama picks clips from the transcript.
+                                    </p>
+                                );
+                            }
+                            const h = Math.floor(start / 3600);
+                            const m = Math.floor((start % 3600) / 60);
+                            const s = Math.floor(start % 60);
+                            const at = h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+                                : `${m}:${String(s).padStart(2, '0')}`;
+                            return (
+                                <p className="text-xs text-brass leading-relaxed">
+                                    Will download ~{Math.round(selfHostSegmentMin)} min starting at {at} on the video
+                                    (from <span className="font-mono">?t=</span>). Submit once and edit clips here when
+                                    they appear — no file upload or chat step.
+                                </p>
+                            );
+                        })()}
                     </div>
                 ) : (
                     <div
@@ -312,7 +364,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook) && (
+                        {(targetClips || clipMinSeconds || clipMaxSeconds || clipBrief.trim() || !autoHook) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>
@@ -354,6 +406,21 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 Targets, not guarantees: the AI returns fewer clips when the
                                 material doesn't hold them. Leave blank to let it decide.
                             </p>
+                            <div className="col-span-1 sm:col-span-3">
+                                <p className="eyebrow mb-1.5">clip brief</p>
+                                <textarea
+                                    value={clipBrief}
+                                    onChange={(e) => setClipBrief(e.target.value)}
+                                    rows={4}
+                                    maxLength={4000}
+                                    placeholder="Campaign or editor notes for the AI moment picker: brands, hashtags, topics to favour or avoid (e.g. Reach × Expedia × IShowSpeed — travel/booking beats, approved on-screen branding)."
+                                    className="input-field resize-y min-h-[5rem] text-sm leading-relaxed"
+                                />
+                                <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
+                                    Ollama/Gemini uses this when choosing moments and writing hook titles.
+                                    Stored in this browser only; up to 4000 characters.
+                                </p>
+                            </div>
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
                                 <span className="text-xs text-ink2">vertical layout</span>
                                 <select

@@ -75,7 +75,10 @@ def allowed_option(name, value=""):
         return False
     if name not in _OPTION_NAMES and not name.startswith(_OPTION_PREFIXES):
         return False
-    return bool(_OPTION_VALUE.match(str(value)))
+    v = str(value)
+    if name == "CLIP_BRIEF":
+        return "\x00" not in v and len(v) <= 4000
+    return bool(_OPTION_VALUE.match(v))
 
 
 def job_options(job_env, base_env):

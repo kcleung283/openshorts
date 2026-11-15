@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Key, Eye, EyeOff, Check } from 'lucide-react';
 
-export default function KeyInput({ onKeySet, savedKey }) {
+export default function KeyInput({ onKeySet, savedKey, localLlm }) {
     const [key, setKey] = useState(savedKey || '');
     const [isVisible, setIsVisible] = useState(false);
     const [isSaved, setIsSaved] = useState(!!savedKey);
@@ -17,6 +17,8 @@ export default function KeyInput({ onKeySet, savedKey }) {
         }
     };
 
+  const llmReady = Boolean(localLlm?.model);
+
     return (
         <div className="card p-4 sm:p-6 mb-8 animate-fade">
             <div className="flex items-center gap-3 mb-4">
@@ -24,7 +26,18 @@ export default function KeyInput({ onKeySet, savedKey }) {
                     <Key size={18} />
                 </div>
                 <h2 className="font-display lowercase text-lg text-ink">Gemini API Key</h2>
+                {llmReady && !savedKey && (
+                    <span className="badge-ok text-[10px]">optional — Ollama active</span>
+                )}
             </div>
+
+            {llmReady && (
+                <p className="text-xs text-muted mb-4 leading-relaxed">
+                    Server is using <span className="font-mono text-ink2">{localLlm.model}</span> at{' '}
+                    <span className="font-mono text-ink2 break-all">{localLlm.baseUrl}</span> for viral moment picking.
+                    You can clip and edit subtitles/hooks without a Gemini key. Add Gemini only if you want AI layouts and effects.
+                </p>
+            )}
 
             <div className="flex flex-col sm:flex-row gap-3">
                 <div className="relative sm:flex-1">
@@ -35,7 +48,7 @@ export default function KeyInput({ onKeySet, savedKey }) {
                             setKey(e.target.value);
                             setIsSaved(false);
                         }}
-                        placeholder="AIzaSy..."
+                        placeholder={llmReady ? 'Optional — AIzaSy...' : 'AIzaSy...'}
                         className="input-field pr-12 font-mono"
                     />
                     <button
@@ -62,7 +75,7 @@ export default function KeyInput({ onKeySet, savedKey }) {
                     rel="noopener noreferrer"
                     className="text-brass hover:underline mt-1 inline-block"
                 >
-                    Get your free Gemini API Key here →
+                    Get a Gemini API Key (not available in all regions) →
                 </a>
             </p>
         </div>

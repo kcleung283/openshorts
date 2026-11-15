@@ -709,6 +709,11 @@ function App() {
       if (session.jobId && session.status && session.status !== 'idle') {
         setJobId(session.jobId);
         setResults(session.results || null);
+        if (session.status === 'complete' && !session.results?.clips?.length) {
+          pollJob(session.jobId).then((data) => {
+            if (data?.result?.clips?.length) setResults(data.result);
+          }).catch(() => {});
+        }
         // Restore the source preview. Older sessions (or uploads) saved no
         // media, so fall back to the backend-served source for this job —
         // except for reopened projects, whose source was never persisted.
@@ -924,7 +929,10 @@ function App() {
   // A self-hosted server running the moment picker on a local LLM
   // (LLM_BASE_URL) does not need a Gemini key for the core pipeline.
   const geminiOk = !!apiKey || !!localLlm;
-  const keysMissing = !billingEnabled && (!geminiOk || !uploadPostKey);
+  // Clip + in-app editing (subtitles, hooks, recut) only need Gemini or LLM_BASE_URL.
+  // Upload-Post is optional — required only for one-click social publish.
+  const keysMissing = !billingEnabled && !authLoading && !geminiOk;
+  const publishKeysMissing = !billingEnabled && !uploadPostKey;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: Clip Generator tutorial (AuthContext set os_show_clip_tutorial
@@ -1197,6 +1205,7 @@ function App() {
         // The stretch picked under the cost line (seconds); absent = whole video.
         source_start: data.sourceStart ?? null,
         source_end: data.sourceEnd ?? null,
+        clip_brief: data.clipBrief || null,
       };
 
       if (data.type === 'url') {
@@ -1646,11 +1655,9 @@ function App() {
               >
                 <AlertTriangle size={12} />
                 <span className="hidden md:inline">
-                  {!geminiOk && !uploadPostKey
-                    ? 'Gemini & Upload-Post keys missing'
-                    : !geminiOk
-                      ? 'Gemini API Key Missing'
-                      : 'Upload-Post API Key Missing'}
+                  {localLlm && !apiKey
+                    ? 'Using local LLM (Ollama)'
+                    : 'Gemini API Key Missing'}
                 </span>
                 <span className="md:hidden">keys missing</span>
               </button>
@@ -1664,13 +1671,13 @@ function App() {
             <div className="flex items-start sm:items-center gap-2.5 sm:gap-3 text-sm text-ink2 min-w-0 flex-1">
               <KeyRound size={16} className="shrink-0 text-warn mt-0.5 sm:mt-0" />
               <div className="min-w-0">
-                <span className="font-medium text-ink">Required API keys missing.</span>{' '}
+                <span className="font-medium text-ink">
+                  {localLlm && !apiKey ? 'Local LLM active' : 'API key missing for clipping.'}
+                </span>{' '}
                 <span className="text-muted">
-                  {!geminiOk && !uploadPostKey
-                    ? 'Set your Gemini and Upload-Post API keys to use OpenShorts.'
-                    : !geminiOk
-                      ? 'Set your Gemini API key to use OpenShorts.'
-                      : 'Set your Upload-Post API key to use OpenShorts.'}
+                  {localLlm && !apiKey
+                    ? 'Moment picking runs on your Ollama model — Gemini is optional (layout picker / AI effects only).'
+                    : 'Set a Gemini key in Settings, or configure LLM_BASE_URL + LLM_MODEL on the server (e.g. Ollama).'}
                 </span>
               </div>
             </div>
@@ -1792,7 +1799,7 @@ function App() {
                 </div>
               ) : (
                 <>
-              <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+              <KeyInput onKeySet={setApiKey} savedKey={apiKey} localLlm={localLlm} />
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
@@ -1802,7 +1809,7 @@ function App() {
                     </div>
                     <h2 className="text-base font-medium text-ink lowercase">Social Integration</h2>
                   </div>
-                  <span className="badge-warn">Required</span>
+                  <span className="readout">{publishKeysMissing ? 'Optional' : 'Connected'}</span>
                 </div>
                 <p className="text-xs text-muted mb-6 leading-relaxed">
                   Required to publish your clips to TikTok, Instagram Reels, and YouTube Shorts via <strong>Upload-Post</strong>.
@@ -2554,8 +2561,11 @@ function App() {
                         </p>
                       </div>
                     ) : status === 'error' ? (
-                      <div className="h-full min-h-[120px] flex flex-col items-center justify-center text-danger space-y-2">
+                      <div className="h-full min-h-[120px] flex flex-col items-center justify-center text-danger space-y-2 px-4 text-center">
                         <p>Generation failed.</p>
+                        {jobError ? (
+                          <p className="text-xs text-danger/90 max-w-md leading-relaxed">{jobError}</p>
+                        ) : null}
                       </div>
                     ) : null
                   )}
@@ -2578,11 +2588,9 @@ function App() {
         isOpen={showKeyModal}
         onClose={() => setShowKeyModal(false)}
         eyebrow="SETUP"
-        title={!geminiOk && !uploadPostKey
-          ? 'Required API Keys Missing'
-          : !geminiOk
-            ? 'Gemini API Key Required'
-            : 'Upload-Post API Key Required'}
+        title={localLlm && !apiKey
+          ? 'Local LLM is configured'
+          : 'Gemini or local LLM required'}
         footer={
           <div className="flex gap-3">
             <button
@@ -2602,16 +2610,22 @@ function App() {
       >
         <div className="space-y-4">
           <p className="text-sm text-muted">
-            OpenShorts needs both a <strong className="text-ink2">Gemini</strong> API key and an <strong className="text-ink2">Upload-Post</strong> API key. Both have free tiers.
+            {localLlm ? (
+              <>Clipping uses your server&apos;s <strong className="text-ink2">Ollama / LLM_BASE_URL</strong> model ({localLlm.model}). Gemini is only needed for smart layouts and AI video effects.</>
+            ) : (
+              <>Add a <strong className="text-ink2">Gemini</strong> key, or set <strong className="text-ink2">LLM_BASE_URL</strong> in the server <code className="text-xs">.env</code> (Ollama).</>
+            )}
           </p>
 
           {/* Gemini block */}
-          <div className={`rounded-input p-4 space-y-2 border ${!apiKey ? 'border-rule2' : 'border-rule opacity-70'}`}>
+          <div className={`rounded-input p-4 space-y-2 border ${!geminiOk ? 'border-rule2' : 'border-rule opacity-70'}`}>
             <p className="text-xs font-medium text-ink flex items-center gap-2">
-              {apiKey ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
-              Gemini API Key {apiKey && <span className="text-ok">— set</span>}
+              {geminiOk ? <Check size={12} className="text-ok" /> : <AlertTriangle size={12} className="text-warn" />}
+              {localLlm && !apiKey
+                ? <>Local LLM <span className="text-ok">— {localLlm.model}</span></>
+                : <>Gemini API Key {apiKey && <span className="text-ok">— set</span>}</>}
             </p>
-            {!apiKey && (
+            {!geminiOk && (
               <>
                 <ol className="text-xs text-muted space-y-1 list-decimal list-inside">
                   <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-brass underline">aistudio.google.com/app/apikey</a></li>

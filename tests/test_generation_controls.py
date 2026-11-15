@@ -59,10 +59,25 @@ def _templates():
     }
 
 
+class TestEditorBrief:
+    def test_brief_from_request_empty(self):
+        assert clip_selection.clip_brief_from_request(None) is None
+        assert clip_selection.clip_brief_from_request("   ") is None
+
+    def test_brief_block_injects_into_prompts(self, monkeypatch):
+        monkeypatch.setenv("CLIP_BRIEF", "Favour Expedia travel moments.")
+        block = clip_selection.editor_brief_block()
+        assert "EDITOR BRIEF" in block
+        assert "Expedia" in block
+        text = _templates()["SCORE_PROMPT_TEMPLATE"].format(
+            video_duration=100, language="en", editor_brief=block, windows_json="[]")
+        assert "Expedia travel moments" in text
+
+
 class TestPromptTemplates:
     def test_detail_template_carries_the_band(self):
         text = _templates()["DETAIL_PROMPT_TEMPLATE"].format(
-            video_duration=100, language="es", min_clips=2, max_clips=4,
+            video_duration=100, language="es", editor_brief="", min_clips=2, max_clips=4,
             min_secs=10.0, max_secs=20.0, windows_json="[]")
         assert "10 to 20 seconds" in text
         assert "return 2 to 4 clips" in text
@@ -79,6 +94,6 @@ class TestPromptTemplates:
         # which capped the shortlist at 3 * n_batches and threw away the
         # ranking it was computing. It scores everything now.
         text = _templates()["SCORE_PROMPT_TEMPLATE"].format(
-            video_duration=100, language="es", windows_json="[]")
+            video_duration=100, language="es", editor_brief="", windows_json="[]")
         assert "Score EVERY window" in text
         assert "up to 3 windows" not in text

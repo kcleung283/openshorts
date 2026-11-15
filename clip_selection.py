@@ -5,6 +5,7 @@ Standard-library only so both main.py and gemini_worker.py can import it and
 the logic stays unit-testable without the heavy video dependencies.
 """
 import math
+import os
 
 # USD per 1M tokens (input, output incl. thinking), from ai.google.dev pricing.
 MODEL_PRICES = {
@@ -211,6 +212,38 @@ def clip_duration_bounds():
     if hi < lo + 5.0:  # keep a real band: degenerate ranges starve the model
         hi = min(180.0, lo + 5.0)
     return round(lo, 3), round(hi, 3)
+
+
+_CLIP_BRIEF_MAX_CHARS = 4000
+
+
+def clip_brief_from_request(raw) -> str | None:
+    """Normalize ``clip_brief`` from the API or MCP; ``None`` when unset."""
+    if raw in (None, ""):
+        return None
+    text = str(raw).replace("\x00", " ").strip()
+    if not text:
+        return None
+    return text[:_CLIP_BRIEF_MAX_CHARS]
+
+
+def editor_brief_block() -> str:
+    """Optional user brief for the moment-picker prompts (``CLIP_BRIEF`` env).
+
+    Set per job from the dashboard ``clip_brief`` field or ``.env``. Empty
+    when unset."""
+    raw = (os.environ.get("CLIP_BRIEF") or "").strip()
+    if not raw:
+        return ""
+    text = raw.replace("\x00", " ")[:_CLIP_BRIEF_MAX_CHARS].strip()
+    if not text:
+        return ""
+    return (
+        "\nEDITOR BRIEF (highest priority when scoring and choosing clips):\n"
+        f"{text}\n"
+        "Penalize moments that violate this brief. Hooks, titles and descriptions "
+        "must follow any brands, hashtags or content rules stated above.\n"
+    )
 
 
 def compact_words(words, precision=2):

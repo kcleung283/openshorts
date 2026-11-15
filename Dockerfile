@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir pip==26.3
 # index first (keep the two pins in step with requirements.txt).
 ARG GPU=0
 RUN if [ "$GPU" != "1" ]; then \
-      pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+      pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
         torch==2.11.0 torchvision==0.26.0; \
     fi
 # Every other Python package comes from a full lock (direct and transitive
@@ -90,6 +90,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-noto-core \
     fonts-noto-color-emoji \
+    build-essential \
+    pkg-config \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libjpeg-dev \
+    libgif-dev \
+    librsvg2-dev \
+    libpixman-1-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 22 from NodeSource: Debian's nodejs package is Node 20, which no

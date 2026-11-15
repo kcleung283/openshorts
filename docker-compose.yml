@@ -4,6 +4,13 @@ services:
     container_name: openshorts-backend
     ports:
       - "8000:8000"
+    environment:
+      # One clip job at a time keeps Whisper + ffmpeg inside Docker Desktop RAM.
+      - MAX_CONCURRENT_JOBS=1
+      # YouTube ?t= links: pull this many minutes from the timestamp (no billing).
+      - SELF_HOST_SEGMENT_MINUTES=35
+      # Plain URLs with no ?t=: download at most this many minutes from the start.
+      - SELF_HOST_SOURCE_CAP_MINUTES=45
     volumes:
       - .:/app
       - /app/__pycache__

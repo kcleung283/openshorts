@@ -34,7 +34,7 @@ import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
-                            score_batches, shortlist_target,
+                            editor_brief_block, score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
                             vision_segments)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
@@ -1019,22 +1019,25 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
     # proxy and a job stuck downloading for tens of minutes. Past the cap (or
     # with no known duration) only the paid range plus a margin is fetched;
     # cap_source_duration still makes the exact cut afterwards.
-    _range_cap = None
+    _fetch_start = 0.0
+    try:
+        _fetch_start = max(0.0, float(os.environ.get("SOURCE_START_SECONDS", "0") or 0))
+    except ValueError:
+        pass
+    _fetch_len = None  # seconds of media to pull (plus margin baked in below)
     if cap_minutes is not None:
-        _range_cap = float(cap_minutes) * 60.0 + 60.0
+        _fetch_len = float(cap_minutes) * 60.0 + 60.0
     for _var, _margin in (() if cap_minutes is not None else
                           (("MAX_SOURCE_MINUTES", 5.0), ("SOURCE_CAP_MINUTES", 60.0))):
         _raw = os.environ.get(_var, "").strip()
         if _raw:
             try:
-                _range_cap = float(_raw) * 60.0 + _margin
-                if _var == "MAX_SOURCE_MINUTES":
-                    # A picked stretch ends at start + length: fetch up to there
-                    # (from 0, so the exact cut afterwards keeps its offsets).
-                    _range_cap += float(os.environ.get("SOURCE_START_SECONDS", "0") or 0)
+                _fetch_len = float(_raw) * 60.0 + _margin
             except ValueError:
                 pass
             break
+    # Extent from t=0 used only for the ranged-vs-whole heuristic.
+    _range_cap = (_fetch_start + _fetch_len) if _fetch_len is not None else None
 
     def _early_audio(info, extractor_args, proxy, cookies):
         """Fetch the audio track alone and hand it to on_audio (background)."""
@@ -1085,9 +1088,12 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         # on a 19-min cap took 8 min ranged against ~30 s whole (prod,
         # 25-sep-2026); a finished 6.7 h livestream is ~13 GB whole.
         ranged = False
-        if _range_cap:
+        if _fetch_len:
             _dur = info.get('duration')
-            ranged = not _dur or float(_dur) > max(3 * _range_cap, _range_cap + 2700)
+            ranged = (
+                _fetch_start > 0
+                or not _dur
+                or float(_dur) > max(3 * _fetch_len, _fetch_len + 2700))
         # Once per download, and not on the per-GB proxy (that is paid bytes,
         # and it is the last resort anyway). Not for a ranged download either:
         # the early audio would be the whole source.
@@ -1106,11 +1112,17 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
             'merge_output_format': 'mp4', 'overwrites': True,
             'progress_hooks': [_progress_hook],
         }
-        if ranged:
+        if ranged and _fetch_len:
             from yt_dlp.utils import download_range_func
-            dl_opts['download_ranges'] = download_range_func(None, [(0, _range_cap)])
-            print(f"✂️ Source is {'of unknown length' if not info.get('duration') else 'longer than the paid minutes'}"
-                  f": downloading only the first {_range_cap / 60:.0f} min.")
+            if _fetch_start > 0:
+                _end = _fetch_start + _fetch_len
+                dl_opts['download_ranges'] = download_range_func(None, [(_fetch_start, _end)])
+                print(f"✂️ Downloading {_fetch_len / 60:.0f} min starting at "
+                      f"{_fetch_start / 60:.1f} min in.")
+            else:
+                dl_opts['download_ranges'] = download_range_func(None, [(0, _fetch_len)])
+                print(f"✂️ Source is {'of unknown length' if not info.get('duration') else 'longer than the paid minutes'}"
+                      f": downloading only the first {_fetch_len / 60:.0f} min.")
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
             if info.get('_type', 'video') == 'video' and info.get('formats'):
                 ydl.process_ie_result(info, download=True)
@@ -2168,9 +2180,12 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
                 out.append(item)
             return out
 
+        brief_block = editor_brief_block()
+
         def _score_prompt(ws):
             return gemini_worker.SCORE_PROMPT_TEMPLATE.format(
                 video_duration=video_duration, language=language,
+                editor_brief=brief_block,
                 windows_json=json.dumps(_payload(ws), ensure_ascii=False))
 
         for batch in score_batches(windows, SCORE_BATCH):
@@ -2203,6 +2218,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             def build(ws):
                 return gemini_worker.DETAIL_PROMPT_TEMPLATE.format(
                     video_duration=video_duration, language=language,
+                    editor_brief=brief_block,
                     min_clips=lo, max_clips=hi,
                     min_secs=min_secs, max_secs=max_secs,
                     windows_json=json.dumps(_payload(ws), ensure_ascii=False))
@@ -2683,11 +2699,35 @@ if __name__ == '__main__':
         print(f"❌ Input file not found: {input_video}")
         exit(1)
 
+    def _cap_start_seconds(path, start_raw):
+        """When yt-dlp already ranged-downloaded a stretch, the file timeline starts
+        at 0 — do not seek again to SOURCE_START_SECONDS on disk."""
+        if start_raw in (None, "", 0, "0"):
+            return 0.0
+        try:
+            start = max(0.0, float(start_raw))
+        except (TypeError, ValueError):
+            return 0.0
+        try:
+            cap = cv2.VideoCapture(path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+            dur = (cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps) if fps else 0.0
+            cap.release()
+        except Exception:
+            dur = 0.0
+        if start > 0 and dur and dur < start + 60.0:
+            print(f"ℹ️ Source is already the picked stretch ({dur / 60:.1f} min); "
+                  f"not cutting again from {start / 60:.1f} min in.")
+            return 0.0
+        return start
+
     # Quota-wall offer: only the first N minutes were paid for (see
     # cap_source_duration). Must run before anything reads the file.
     if os.environ.get("MAX_SOURCE_MINUTES", "").strip():
-        input_video = cap_source_duration(input_video, os.environ["MAX_SOURCE_MINUTES"],
-                                          start_seconds=os.environ.get("SOURCE_START_SECONDS", 0))
+        input_video = cap_source_duration(
+            input_video, os.environ["MAX_SOURCE_MINUTES"],
+            start_seconds=_cap_start_seconds(
+                input_video, os.environ.get("SOURCE_START_SECONDS", 0)))
     elif os.environ.get("SOURCE_CAP_MINUTES", "").strip():
         # Whole-video metered job: never process more than was reserved.
         def _stamp(path):

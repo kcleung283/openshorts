@@ -11,7 +11,7 @@ from google.genai import types as genai_types
 from pydantic import BaseModel
 
 from clip_selection import (clip_count_targets, clip_duration_bounds,
-                            lookup_model_prices)
+                            editor_brief_block, lookup_model_prices)
 
 load_dotenv()
 
@@ -254,7 +254,7 @@ def _log(message: str) -> None:
 SCORE_PROMPT_TEMPLATE = """
 You are a senior short-form video strategist.
 RANK these candidate windows by how well each would work as a standalone short.
-
+{editor_brief}
 Rules:
 - Return only valid JSON.
 - Score EVERY window in this batch: exactly one entry per input window, with
@@ -296,7 +296,7 @@ Return only:
 DETAIL_PROMPT_TEMPLATE = """
 You are a senior short-form video editor and viral copywriter.
 Choose the BEST short clips from these shortlisted candidate windows.
-
+{editor_brief}
 CLIP RULES:
 - Return only valid JSON.
 - Each clip must be {min_secs:g} to {max_secs:g} seconds long, in absolute seconds from the start of the source video.
@@ -606,6 +606,7 @@ def main() -> int:
         "video_duration": payload["video_duration"],
         "language": language,
         "windows_json": json.dumps(payload["windows"], ensure_ascii=False),
+        "editor_brief": editor_brief_block(),
     }
     if args.mode != "score":
         # Score mode receives every window, not a shortlist, so a count target

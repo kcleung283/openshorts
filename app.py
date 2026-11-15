@@ -30,6 +30,8 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+import clip_selection
+import self_host_source
 import recut
 import layout_ranges
 import watermarked
@@ -4649,6 +4651,11 @@ def _finish_job(job_id, returncode, output_dir):
     else:
         jobs[job_id]['status'] = 'failed'
         jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
+        if returncode == -9:
+            jobs[job_id]['logs'].append(
+                "The worker was killed (usually out of memory). Use a shorter source, "
+                "upload a pre-cut file, or paste a YouTube link with ?t= so only that "
+                "segment is downloaded.")
 
 
 async def _run_main(job_id, cmd, env, tick=None):
@@ -5076,6 +5083,11 @@ async def get_config():
         # Self-host only: tells the dashboard the Gemini key is optional
         # because the moment picker runs on an OpenAI-compatible server.
         "localLlm": None if BILLING_ENABLED else llm_backend.describe(),
+        # Self-host YouTube URLs with ?t=: download this many minutes from the
+        # timestamp (see self_host_source.py), no upload / manual yt-dlp needed.
+        "selfHostYoutubeSegment": None if BILLING_ENABLED else {
+            "minutes": float(self_host_source._segment_minutes()),
+        },
     }
 
 async def _probe_youtube_quality(url: str) -> dict:
@@ -5452,6 +5464,7 @@ async def process_endpoint(
     target_clips: Optional[str] = Form(None),
     clip_min_seconds: Optional[str] = Form(None),
     clip_max_seconds: Optional[str] = Form(None),
+    clip_brief: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
     auto_hook_style: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
@@ -5486,6 +5499,7 @@ async def process_endpoint(
         target_clips = body.get("target_clips")
         clip_min_seconds = body.get("clip_min_seconds")
         clip_max_seconds = body.get("clip_max_seconds")
+        clip_brief = body.get("clip_brief")
         auto_hook = body.get("auto_hook")
         auto_hook_style = body.get("auto_hook_style")
         thumbnail_session_id = body.get("thumbnail_session_id")
@@ -5637,6 +5651,11 @@ async def process_endpoint(
     if n_clips is not None or min_secs is not None or max_secs is not None:
         print(f"[gen-controls] job={job_id} clips={n_clips} band={min_secs}-{max_secs}")
 
+    brief = clip_selection.clip_brief_from_request(clip_brief)
+    if brief:
+        env["CLIP_BRIEF"] = brief
+        print(f"[gen-controls] job={job_id} clip_brief={len(brief)} chars")
+
     # captions=false: the source already carries burned-in subtitles (or the
     # caller adds its own later), so skip the free auto-caption pass instead
     # of stacking a second layer. Absent → the deployment default (on).
@@ -5726,6 +5745,12 @@ async def process_endpoint(
         user_id, priority, reservation_id, user_plan, partial = await reserve_process_minutes(
             request, url, input_path, job_id, max_minutes=max_minutes,
             source_range=_parse_source_range(source_start, source_end))
+        if not BILLING_ENABLED and not partial:
+            partial = self_host_source.plan_self_host_partial(
+                url, _parse_source_range(source_start, source_end), MIN_RANGE_SECONDS)
+            if partial:
+                print(f"[self-host] job={job_id} source segment "
+                      f"{partial['start_seconds']}–{partial['end_seconds']}s")
     except BaseException:
         _discard_rejected_source(input_path, job_output_dir,
                                  upload_slot=upload_slot, upload_id=upload_id)
@@ -5762,6 +5787,14 @@ async def process_endpoint(
     else:
         env.pop("SOURCE_CAP_MINUTES", None)
         source_cap = None
+        if not BILLING_ENABLED and url and not partial:
+            try:
+                cap = int(os.environ.get("SELF_HOST_SOURCE_CAP_MINUTES", "45"))
+            except ValueError:
+                cap = 45
+            if cap > 0:
+                env["SOURCE_CAP_MINUTES"] = str(cap)
+                print(f"[self-host] job={job_id} whole-url cap={cap} min (no ?t= segment)")
     skip_statics = bool(url) and bool(getattr(request.state, "skip_statics", False))
     if skip_statics:
         env["DOWNLOAD_SKIP_STATICS"] = "1"
@@ -5924,7 +5957,7 @@ async def get_status(job_id: str, request: Request):
 
     await _assert_job_owner(request, job)
     _logs_view = _visible_logs_timed(job['logs'])
-    return {
+    out = {
         "status": _presented_status(job_id, job),
         "logs": _logs_view[0],
         # When each line arrived (epoch seconds, parallel to "logs"), or None.
@@ -5936,6 +5969,9 @@ async def get_status(job_id: str, request: Request):
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
     }
+    if job.get('status') == 'failed':
+        out["error"] = _job_error_text(list(job.get('logs') or []))[-500:]
+    return out
 
 
 def _locate_source(job_id: str):
