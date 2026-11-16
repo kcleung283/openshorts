@@ -2445,16 +2445,13 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
     stretch (``vision_segments``), and the picks are merged, de-overlapped
     and cut to the best ``CLIP_TARGET_MAX`` by score: a silent multi-hour
     console capture used to fail at the model."""
-    print("🎥  Silent video — analyzing with Gemini vision (no transcript)...")
+    print("🎥  Sparse speech / music — vision clip pass...")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        if llm_backend.active():
-            print("❌ This video has no usable speech, so it has to be clipped by "
-                  "watching it, and that needs Gemini (a text-only LLM server "
-                  "cannot see the footage). Add a GEMINI_API_KEY for silent videos.")
-        else:
-            print("❌ Error: GEMINI_API_KEY not found.")
-        return None
+        import heuristic_clips
+        title = os.path.splitext(os.path.basename(video_path))[0]
+        return heuristic_clips.get_heuristic_visual_clips(
+            video_path, video_duration, video_title=title, language=language)
     client = genai.Client(api_key=api_key)
     model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
 
@@ -2530,7 +2527,10 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
         raise
     except Exception as e:
         print(f"❌ Gemini vision error: {e}")
-        return None
+        import heuristic_clips
+        title = os.path.splitext(os.path.basename(video_path))[0]
+        return heuristic_clips.get_heuristic_visual_clips(
+            video_path, video_duration, video_title=title, language=language)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
@@ -2857,7 +2857,7 @@ if __name__ == '__main__':
         if transcript is not None and speech_is_sparse(transcript, duration):
             n_words = sum(len((sg.get("text") or "").split()) for sg in transcript["segments"])
             print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
-                  f"switching to visual analysis.")
+                  f"switching to music/silent clip picker.")
             transcript = None
 
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)

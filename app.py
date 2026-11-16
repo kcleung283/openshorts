@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import clip_selection
 import self_host_source
+import self_host_extras
 import recut
 import layout_ranges
 import watermarked
@@ -4015,6 +4016,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_handover_watch())
     asyncio.create_task(_resume_scan())
     cleanup_task = asyncio.create_task(cleanup_jobs())
+    if not BILLING_ENABLED:
+        asyncio.create_task(_self_host_schedule_loop())
     if BILLING_ENABLED:
         await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids,
                                 live_reservation_ids=_live_reservation_ids,
@@ -4645,6 +4648,12 @@ def _finish_job(job_id, returncode, output_dir):
                     jobs[job_id]['logs'].append(
                         f"⚠️ {missing} of {len(clips)} clips failed to render.")
                 jobs[job_id]['result'] = {'clips': rendered, 'cost_analysis': cost_analysis}
+                if not BILLING_ENABLED:
+                    try:
+                        self_host_extras.record_completed_job(
+                            job_id, output_dir, rendered, title=base_name)
+                    except Exception as e:
+                        print(f"[self-host] history index: {e}")
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append("No metadata file generated.")
@@ -5088,7 +5097,250 @@ async def get_config():
         "selfHostYoutubeSegment": None if BILLING_ENABLED else {
             "minutes": float(self_host_source._segment_minutes()),
         },
+        "selfHostExtras": not BILLING_ENABLED,
     }
+
+
+class SelfHostScheduleSettings(BaseModel):
+    enabled: Optional[bool] = None
+    interval_hours: Optional[int] = None
+    timezone: Optional[str] = None
+    platforms: Optional[List[str]] = None
+    posting_backend: Optional[str] = None
+
+
+class SelfHostScheduleEnqueue(BaseModel):
+    job_id: str
+    clip_index: int = 0
+    title: Optional[str] = None
+
+
+class SelfHostMashupRequest(BaseModel):
+    sources: List[dict]
+    music_url: Optional[str] = None
+    music_note: Optional[str] = ""
+    timeline: Optional[List[dict]] = None
+    auto_beats: bool = False
+    beats_from: str = "music"
+    beat_effect: Optional[str] = None
+    beat_strength: Optional[float] = None
+    beat_duration: Optional[float] = None
+    effects_at_joins: bool = False
+    join_effect: Optional[str] = None
+
+
+class SelfHostMashupSuggestBeats(BaseModel):
+    music_url: Optional[str] = None
+    video_path: Optional[str] = None
+    effect_type: str = "zoom_pulse"
+    strength: Optional[float] = None
+    effect_duration: float = 0.55
+    max_beats: int = 12
+
+
+@app.get("/api/self-host/schedule")
+async def self_host_schedule_get():
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Self-host only")
+    s = self_host_extras.schedule_settings()
+    s["upload_post_configured"] = bool(os.environ.get("UPLOAD_POST_API_KEY", "").strip())
+    s.setdefault("posting_backend", self_host_extras._default_posting_backend())
+    s["ready_to_post_dir"] = os.path.join(
+        os.environ.get("SELF_HOST_DATA_DIR", "data"), "ready_to_post")
+    return s
+
+
+@app.put("/api/self-host/schedule")
+async def self_host_schedule_put(body: SelfHostScheduleSettings):
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Self-host only")
+    return self_host_extras.update_schedule_settings(body.model_dump(exclude_none=True))
+
+
+@app.post("/api/self-host/schedule/enqueue")
+async def self_host_schedule_enqueue(body: SelfHostScheduleEnqueue):
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Self-host only")
+    try:
+        return self_host_extras.enqueue_clip(body.job_id, body.clip_index, title=body.title)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/self-host/mashup")
+async def self_host_mashup(body: SelfHostMashupRequest):
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Self-host only")
+    if not body.sources or len(body.sources) < 2:
+        raise HTTPException(status_code=400, detail="Need at least two clips")
+    mashup_id = str(uuid.uuid4())
+    out_dir = os.path.join(OUTPUT_DIR, "_mashups", mashup_id)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "combined.mp4")
+    try:
+        meta = await asyncio.to_thread(
+            self_host_extras.run_mashup,
+            sources=body.sources,
+            music_url=body.music_url,
+            music_note=body.music_note or "",
+            output_path=out_path,
+            work_dir=out_dir,
+            timeline=body.timeline,
+            auto_beats=body.auto_beats,
+            beats_from=body.beats_from,
+            beat_effect=body.beat_effect,
+            beat_strength=body.beat_strength,
+            beat_duration=body.beat_duration,
+            effects_at_joins=body.effects_at_joins,
+            join_effect=body.join_effect,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    rel = f"/videos/_mashups/{mashup_id}/combined.mp4"
+    return {"mashup_id": mashup_id, "video_url": rel, "meta": meta}
+
+
+@app.get("/api/self-host/mashup/effects")
+async def self_host_mashup_effects():
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Self-host only")
+    import mashup_timeline as _mt
+
+    return {"effects": _mt.effect_catalog()}
+
+
+@app.post("/api/self-host/mashup/suggest-beats")
+async def self_host_mashup_suggest_beats(body: SelfHostMashupSuggestBeats):
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Self-host only")
+    import mashup_timeline as _mt
+    import tempfile
+
+    work = tempfile.mkdtemp(prefix="beat_suggest_")
+    try:
+        audio_path = body.video_path
+        if body.music_url and body.music_url.strip():
+            import httpx
+
+            audio_path = os.path.join(work, "music.bin")
+            with httpx.Client(timeout=120, follow_redirects=True) as client:
+                r = client.get(body.music_url.strip())
+                r.raise_for_status()
+                with open(audio_path, "wb") as mf:
+                    mf.write(r.content)
+        if not audio_path or not os.path.isfile(audio_path):
+            raise HTTPException(status_code=400, detail="Provide music_url or an existing video_path")
+        rows = _mt.beats_from_audio(
+            audio_path,
+            effect_type=body.effect_type,
+            strength=body.strength,
+            effect_seconds=body.effect_duration,
+            max_beats=max(1, min(body.max_beats, 12)),
+        )
+        return {"suggestions": rows, "effect_catalog": _mt.effect_catalog()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+if not BILLING_ENABLED:
+    @app.get("/api/history")
+    async def api_history_local():
+        return self_host_extras.history_response()
+
+    @app.get("/api/projects")
+    async def api_projects_local():
+        return self_host_extras.projects_response()
+
+
+async def _self_host_schedule_loop():
+    """Post queued clips through Upload-Post on the self-host interval."""
+    while True:
+        await asyncio.sleep(60)
+        if BILLING_ENABLED or _draining:
+            continue
+        if not self_host_extras.schedule_settings().get("enabled"):
+            continue
+        for item in self_host_extras.due_schedule_items():
+            try:
+                await _self_host_post_scheduled(item)
+                backend = self_host_extras.schedule_settings().get("posting_backend") or "manual"
+                status = "ready" if backend == "manual" else "posted"
+                self_host_extras.mark_schedule_item(item["id"], status)
+            except Exception as e:
+                self_host_extras.mark_schedule_item(item["id"], "failed", error=str(e))
+                print(f"[schedule] failed {item.get('id')}: {e}")
+
+
+async def _self_host_post_scheduled(item: dict):
+    settings = self_host_extras.schedule_settings()
+    backend = (settings.get("posting_backend")
+               or self_host_extras._default_posting_backend())
+    job_id = item["job_id"]
+    idx = int(item.get("clip_index") or 0)
+    job = jobs.get(job_id) or _job_view_from_disk(job_id)
+    if not job or not job.get("result", {}).get("clips"):
+        raise RuntimeError(f"job {job_id} has no clips")
+    clip = job["result"]["clips"][idx]
+    file_path, filename = _clip_delivery_path(job_id, clip, idx)
+    platforms = settings.get("platforms") or ["youtube", "instagram"]
+    final_title = (item.get("title") or clip.get("video_title_for_youtube_short")
+                   or clip.get("title", "Short"))
+    final_description = (clip.get("video_description_for_instagram")
+                       or clip.get("video_description_for_tiktok") or "")
+    if backend == "manual":
+        await asyncio.to_thread(
+            self_host_extras.export_ready_to_post,
+            item, file_path,
+            title=final_title,
+            description=final_description,
+            platforms=platforms,
+        )
+        return
+    key = os.environ.get("UPLOAD_POST_API_KEY", "").strip()
+    profile = os.environ.get("UPLOAD_POST_PROFILE", "").strip()
+    if not key or not profile:
+        raise RuntimeError("Set UPLOAD_POST_API_KEY and UPLOAD_POST_PROFILE for upload_post backend")
+    req = SocialPostRequest(
+        job_id=job_id, clip_index=idx, platforms=platforms,
+        title=final_title,
+    )
+    upload_key = key
+    post_user = profile
+    data_payload = {
+        "user": post_user,
+        "title": final_title,
+        "platform[]": platforms,
+        "async_upload": "true",
+    }
+    if "youtube" in platforms:
+        data_payload["youtube_title"] = youtube_title(
+            clip.get("video_title_for_youtube_short", final_title))
+        data_payload["youtube_description"] = final_description
+        data_payload["privacyStatus"] = "public"
+    if "instagram" in platforms:
+        data_payload["instagram_title"] = final_description
+        data_payload["media_type"] = "REELS"
+    headers = {"Authorization": f"Apikey {upload_key}"}
+    url = "https://api.upload-post.com/api/upload"
+    response = await asyncio.to_thread(
+        _post_video_blocking, url, headers, data_payload, file_path, filename, 120.0)
+    if response.status_code not in (200, 201, 202):
+        raise RuntimeError(response.text[:300])
+
+
+def _clip_delivery_path(job_id, clip, idx):
+    """Resolve on-disk clip path for posting."""
+    url = clip.get("video_url") or ""
+    name = url.split("/")[-1] if url else None
+    if not name:
+        raise RuntimeError("clip has no file")
+    path = os.path.join(OUTPUT_DIR, job_id, name)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    return path, name
+
 
 async def _probe_youtube_quality(url: str) -> dict:
     """What the source offers ({max_height, duration, ...}); {} on any failure
