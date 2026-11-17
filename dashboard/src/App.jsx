@@ -32,6 +32,7 @@ import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError, QUOTA_WALL_EVENT } from './lib/api';
+import { SOCIAL_PLATFORMS } from './lib/socialPlatforms';
 import { track } from './lib/analytics';
 import { readConnectReturn, stripConnectReturn } from './lib/connectReturn';
 import { rememberTabAfterLogin } from './lib/tabAfterLogin';
@@ -144,6 +145,9 @@ const formatRetention = (seconds) => {
   return `${Math.max(1, Math.round(seconds / 60))} min`;
 };
 
+// TikTok, Instagram and YouTube have their own icons above; the rest come from the shared list.
+const EXTRA_NETWORKS = SOCIAL_PLATFORMS.slice(3);
+
 const ProfileNetworkIcons = ({ profile, size = 12 }) => (
   <span className="flex items-center gap-1.5">
     <span className={profile?.connected?.includes('tiktok') ? 'text-ink' : 'text-muted opacity-40'}>
@@ -155,6 +159,11 @@ const ProfileNetworkIcons = ({ profile, size = 12 }) => (
     <span className={profile?.connected?.includes('youtube') ? 'text-ink' : 'text-muted opacity-40'}>
       <Youtube size={size} />
     </span>
+    {EXTRA_NETWORKS.map((p) => (
+      <span key={p.value} className={profile?.connected?.includes(p.value) ? 'text-ink' : 'text-muted opacity-40'}>
+        <p.Icon size={size} />
+      </span>
+    ))}
   </span>
 );
 
@@ -221,6 +230,11 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect, onConnect }) 
                       <div className={`flex items-center gap-1 ${profile.connected.includes('youtube') ? 'text-ink2' : 'text-muted opacity-40'}`}>
                         <Youtube size={10} />
                       </div>
+                      {EXTRA_NETWORKS.map((p) => (
+                        <div key={p.value} className={`flex items-center gap-1 ${profile.connected.includes(p.value) ? 'text-ink2' : 'text-muted opacity-40'}`}>
+                          <p.Icon size={10} />
+                        </div>
+                      ))}
                     </div>
                   </div>
                 </div>
@@ -862,6 +876,21 @@ function App() {
 
           if (data.partial) setPartialJob(data.partial);
           setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
+          if (data.source_preview_url && jobId) {
+            setProcessingMedia({ type: 'server', payload: `/api/source/${jobId}` });
+          } else if (data.compose_previews?.length && jobId) {
+            const latest = data.compose_previews[data.compose_previews.length - 1];
+            const partUrl = latest.url || (
+              latest.file
+                ? `/api/source/${jobId}?part=${encodeURIComponent(latest.file)}`
+                : `/api/source/${jobId}`
+            );
+            setProcessingMedia({
+              type: 'server',
+              payload: partUrl,
+              composePartTitle: latest.title || null,
+            });
+          }
 
           if (data.status === 'completed') {
             setQueueInfo(null);
@@ -1176,7 +1205,16 @@ function App() {
     setResults(null);
     // Studio handovers have no local media object; the preview switches to the
     // backend-served source once the job id is known.
-    setProcessingMedia(data.type === 'thumbnail_session' ? null : data);
+    setProcessingMedia(
+      data.type === 'thumbnail_session' ? null
+        : data.type === 'multi_compose' && data.multiVideoFiles?.[0]
+          ? { type: 'file', payload: data.multiVideoFiles[0] }
+          : data.type === 'multi_url' && data.videoUrls?.[0]
+            ? { type: 'url', payload: data.videoUrls[0] }
+            : data.type === 'multi_compose' || data.type === 'multi_url'
+              ? null
+              : data
+    );
     setQualityGate(null);
     setProjectState(null);
     setNoSource(false);
@@ -1219,6 +1257,26 @@ function App() {
           force_low_quality: forceLowQuality,
           ...Object.fromEntries(Object.entries(advanced).filter(([, v]) => v != null)),
         });
+      } else if (data.type === 'multi_url' || data.type === 'multi_compose') {
+        const formData = new FormData();
+        for (const vf of data.multiVideoFiles || []) {
+          formData.append('compose_videos', vf);
+        }
+        if (data.musicFile) formData.append('music_file', data.musicFile);
+        const urls = data.videoUrls || [];
+        if (urls.length || data.type === 'multi_url') {
+          formData.append('video_urls', JSON.stringify(urls));
+        }
+        if (data.musicUrl) formData.append('music_url', data.musicUrl);
+        formData.append('mute_source', data.muteSource ? '1' : '0');
+        formData.append('multi_source', '1');
+        formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
+        formData.append('output_format', data.outputFormat || 'auto');
+        if (forceLowQuality) formData.append('force_low_quality', '1');
+        for (const [k, v] of Object.entries(advanced)) {
+          if (v != null) formData.append(k, v);
+        }
+        body = formData;
       } else if (data.type === 'thumbnail_session') {
         // Handover from Thumbnail Studio (issue #68): the video and transcript
         // already live server-side, keyed by the Studio session.
@@ -1263,6 +1321,14 @@ function App() {
         track('AutoPartial', { props: { processed: resData.partial.processed_minutes, total: resData.partial.total_minutes } });
       }
       if (data.type === 'thumbnail_session') {
+        setProcessingMedia({ type: 'server', payload: `/api/source/${resData.job_id}` });
+      } else if (
+        (data.type === 'multi_compose' || data.type === 'multi_url')
+        && !data.multiVideoFiles?.[0]
+      ) {
+        // Merged source preview appears once combine/download finishes; polling
+        // also sets this from source_preview_url, but wire the panel now so Live
+        // Analysis is visible for URL-only multi-source jobs too.
         setProcessingMedia({ type: 'server', payload: `/api/source/${resData.job_id}` });
       }
       // Minutes are reserved at job start, not at complete.

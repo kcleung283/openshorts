@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Optional, Tuple, Type
 
 import httpx
@@ -79,8 +80,51 @@ def _headers() -> dict:
 
 
 def _client(**kwargs) -> httpx.Client:
-    """Factory so tests can swap in ``httpx.MockTransport``."""
-    return httpx.Client(timeout=_timeout(), **kwargs)
+    """Factory so tests can swap in ``httpx.MockTransport``.
+
+    A fresh client per request avoids talking to Ollama over a stale keep-alive
+  socket that the server already closed (shows up as "Server disconnected
+  without sending a response" from httpx)."""
+    timeout = httpx.Timeout(_timeout(), connect=60.0)
+    return httpx.Client(timeout=timeout, **kwargs)
+
+
+_TRANSIENT_MSG_FRAGMENTS = (
+    "503", "unavailable", "429", "resource_exhausted",
+    "500", "internal", "overloaded", "deadline",
+    "empty response body", "did not contain a json object",
+    "failed to parse gemini json response",
+    "connecterror", "readtimeout", "remoteprotocolerror", "502", "504",
+    "validation error",
+    "disconnected", "connection reset", "connection aborted",
+    "peer closed", "broken pipe", "eof", "incomplete read",
+    "server disconnected",
+)
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """HTTP / local-LLM failures worth retrying in ``main._run_gemini_stage``."""
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+            httpx.WriteError,
+            httpx.PoolTimeout,
+            httpx.TimeoutException,
+        ),
+    ):
+        return True
+    msg = str(exc).lower()
+    return any(tok in msg for tok in _TRANSIENT_MSG_FRAGMENTS)
+
+
+def _request_attempts() -> int:
+    try:
+        return max(1, int(os.environ.get("LLM_REQUEST_ATTEMPTS", "3")))
+    except ValueError:
+        return 3
 
 
 def _response_formats(schema: Type[BaseModel]):
@@ -117,25 +161,38 @@ def generate_json(prompt: str, schema: Type[BaseModel], model: Optional[str] = N
         {"role": "user", "content": prompt},
     ]
     last_rejection: Optional[str] = None
-    with _client() as client:
-        for fmt in _response_formats(schema):
-            body = {"model": model, "messages": messages, "temperature": 0.2, "stream": False}
-            if fmt is not None:
-                body["response_format"] = fmt
-            resp = client.post(url, json=body, headers=_headers())
-            if fmt is not None and _is_format_rejection(resp):
-                # The server does not know this response_format flavour; the
-                # next loop iteration asks for a looser one.
-                last_rejection = resp.text[:200]
-                continue
-            if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"LLM server {resp.status_code} from {url}: {resp.text[:300]}")
-            data = resp.json()
+    data = None
+    for request_attempt in range(1, _request_attempts() + 1):
+        try:
+            with _client() as client:
+                for fmt in _response_formats(schema):
+                    body = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": 0.2,
+                        "stream": False,
+                    }
+                    if fmt is not None:
+                        body["response_format"] = fmt
+                    resp = client.post(url, json=body, headers=_headers())
+                    if fmt is not None and _is_format_rejection(resp):
+                        last_rejection = resp.text[:200]
+                        continue
+                    if resp.status_code >= 400:
+                        raise RuntimeError(
+                            f"LLM server {resp.status_code} from {url}: {resp.text[:300]}")
+                    data = resp.json()
+                    break
+                else:
+                    raise RuntimeError(
+                        f"LLM server rejected every response_format variant: {last_rejection}")
             break
-        else:
-            raise RuntimeError(
-                f"LLM server rejected every response_format variant: {last_rejection}")
+        except httpx.HTTPError as e:
+            if request_attempt >= _request_attempts() or not is_transient_error(e):
+                raise
+            time.sleep(min(30.0, 2.0 ** request_attempt))
+    if data is None:
+        raise RuntimeError(f"LLM server returned no body from {url}")
 
     choices = data.get("choices") or []
     text = ""

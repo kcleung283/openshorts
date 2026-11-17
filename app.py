@@ -19,6 +19,7 @@ import heapq
 import asyncio
 import signal
 import socket
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
@@ -26,13 +27,13 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import clip_selection
 import self_host_source
-import self_host_extras
+import source_compose
 import recut
 import layout_ranges
 import watermarked
@@ -671,9 +672,7 @@ async def _reserve_after_job_limit(request, user, url, input_path, job_id, max_m
         if cached is not None:
             minutes = cached
         elif url:
-            minutes = await loop.run_in_executor(
-                None, functools.partial(_metering.probe_url_minutes, url,
-                                        allow_paid=paid_allowed))
+            minutes = await _metering.run_probe(url, allow_paid=paid_allowed)
         else:
             minutes = await loop.run_in_executor(None, _metering.probe_file_minutes, input_path)
     except Exception as e:
@@ -886,11 +885,30 @@ async def _assert_job_owner(request, record):
     owner = record.get("user_id") if isinstance(record, dict) else None
     if owner is None:
         return
-    user = await _user_from_request(request)
     # Compare as strings: live jobs store a uuid.UUID, but jobs recovered from
     # the .owner sidecar store its string form — UUID != str is always True.
-    if user is None or str(user.id) != str(owner):
+    if await _owner_id_from_request(request) != str(owner):
         raise HTTPException(status_code=404, detail="Not found")
+
+
+# Who the caller of a GET is, remembered per credential for the owner check
+# alone, with a cap on how many of those lookups hold a pool connection at once
+# (cloud/owner_cache.py). A ban, a revoked key or an erased account forgets it.
+from cloud import owner_cache as _owner_cache
+
+
+async def _owner_id_from_request(request):
+    credential = (request.headers.get("Authorization", "")
+                  + "\n" + request.headers.get("X-API-Key", ""))
+    if request.method != "GET" or not credential.strip():
+        user = await _user_from_request(request)
+        return str(user.id) if user is not None else None
+    try:
+        return await _owner_cache.owner_id(credential,
+                                           lambda: _user_from_request(request))
+    except _owner_cache.Busy:
+        raise HTTPException(status_code=503, detail="Busy, retry shortly.",
+                            headers={"Retry-After": "3"})
 
 # Application State
 # PriorityQueue holds (priority, key, job_id). Lower priority dispatches first:
@@ -1936,6 +1954,32 @@ REMOTE_MAX_SECONDS = _int_env("REMOTE_MAX_SECONDS", 3600)
 REMOTE_BREAKER_FAILURES = _int_env("REMOTE_BREAKER_FAILURES", 4)
 REMOTE_BREAKER_WINDOW = 10           # ...counted over the last this many
 REMOTE_BREAKER_SECONDS = _int_env("REMOTE_BREAKER_SECONDS", 1800)
+
+
+def _quiet_minutes(spec):
+    """Minutes of the hour (UTC) given as "55-5,28-32": wrap-around ranges."""
+    out = set()
+    for part in (spec or "").split(","):
+        try:
+            a, _, b = part.strip().partition("-")
+            a, b = int(a) % 60, int(b or a) % 60
+        except ValueError:
+            continue
+        m = a
+        while True:
+            out.add(m)
+            if m == b:
+                break
+            m = (m + 1) % 60
+    return out
+
+
+# No new claim in these minutes of the hour: the worker's host also carries
+# Upload-Post, whose scheduled posts fill its link at :00-:05. A claim is a
+# ~1 GB source sent over that link a minute or two later.
+REMOTE_QUIET_MINUTES = _quiet_minutes(os.environ.get("REMOTE_QUIET_MINUTES", ""))
+# Per-transfer cap on the source sent to the worker, in Mbit/s (0: none).
+REMOTE_SOURCE_MBPS = _int_env("REMOTE_SOURCE_MBPS", 0)
 _remote_jobs: set = set()            # the subset of _running_jobs run remotely
 _remote_breaker = {"recent": [], "until": 0.0}
 
@@ -3814,6 +3858,31 @@ def _rm_under(base_dir: str, relative: str):
             pass
 
 
+def _support_ops_local_jobs(user_id) -> dict:
+    """This process's in-memory jobs of one user, for the support back-office's
+    activity view (cloud/support_ops.py): live status, why a failed one failed,
+    where its source came from. Read-only."""
+    uid = str(user_id)
+    out = {}
+    for job_id, job in list(jobs.items()):
+        if str(job.get('user_id')) != uid:
+            continue
+        status = job.get('status')
+        error = None
+        if status == 'failed':
+            try:
+                error = _job_error_text(list(job.get('logs') or []))[-500:]
+            except Exception:
+                error = None
+        out[job_id] = {
+            'status': status,
+            'error': error,
+            'source': (job.get('attestation') or {}).get('source'),
+            'created_at': job.get('submitted_at'),
+        }
+    return out
+
+
 def _purge_local_jobs_for_user(user_id) -> int:
     """Delete this user's working files and in-memory records from local disk.
 
@@ -4037,6 +4106,8 @@ async def lifespan(app: FastAPI):
         # Account erasure lives in cloud/, which can't import app.py; hand it the
         # one thing only this module can do — wipe the local working files.
         cloud.account.register_local_purge(_purge_local_jobs_for_user)
+        # The support back-office's activity view reads live job state too.
+        cloud.support_ops.register_local_jobs(_support_ops_local_jobs)
         # Same arrangement for the watermark: when a user upgrades, cloud/videos
         # re-points their clips at the clean twins in R2 and hands us each
         # one so the working copy (and an open dashboard) follows.
@@ -4099,6 +4170,9 @@ app.add_middleware(
     # they only become readable to JS once they are named here.
     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"],
 )
+if BILLING_ENABLED:
+    # Outside CORS: the support-ops routes never answer a browser.
+    app.add_middleware(cloud.support_ops.CorsGuard)
 
 # --- Who may read /videos and /thumbnails ------------------------------------
 # A job id used to be the whole lock on a job's clips and on the untouched
@@ -4782,6 +4856,8 @@ def _claim_remote_job(worker):
         return None
     if time.time() < _remote_breaker["until"]:
         return None
+    if time.gmtime().tm_min in REMOTE_QUIET_MINUTES:
+        return None
     heap = job_queue._queue
     for entry in sorted(heap):
         prio, _key, job_id = entry
@@ -5017,7 +5093,48 @@ async def worker_source(job_id: str, request: Request):
     if not real or not any(real.startswith(r + os.sep) for r in roots) or not os.path.isfile(real):
         raise HTTPException(status_code=404, detail="Not found")
     remote_worker.touch_seen(job_dir)
-    return FileResponse(real, media_type="application/octet-stream")
+    return StreamingResponse(_source_chunks(real, job_dir), media_type="application/octet-stream",
+                             headers={"Content-Length": str(os.path.getsize(real))})
+
+
+SOURCE_CHUNK = 1024 * 1024
+# REMOTE_SOURCE_MBPS is for all transfers together: when a quiet window ends,
+# up to REMOTE_WORKER_SLOTS sources leave at once for the same link.
+_source_bucket = {"free_at": 0.0}
+_source_lock = threading.Lock()
+
+
+def _source_turn(nbytes) -> float:
+    """Seconds this chunk's sender sleeps so the sum stays under the cap."""
+    with _source_lock:
+        now = time.time()
+        start = max(now, _source_bucket["free_at"])
+        _source_bucket["free_at"] = start + nbytes * 8 / (REMOTE_SOURCE_MBPS * 1e6)
+        return max(0.0, _source_bucket["free_at"] - now)
+SOURCE_SEEN_EVERY = 10           # seconds between lease touches while sending
+
+
+def _source_chunks(path, job_dir):
+    """The source file in chunks, touching the worker's lease while it is sent.
+
+    The worker makes no other call during the download, and a source of
+    ~1 GB sent from a busy host took more than REMOTE_LEASE_SECONDS (16-nov):
+    the job was taken back mid-transfer, four of them tripped the breaker and
+    the worker sat idle while this host was the one out of CPU. A sync
+    generator: Starlette reads it in a thread, off the event loop."""
+    last = time.time()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(SOURCE_CHUNK)
+            if not chunk:
+                break
+            yield chunk
+            if REMOTE_SOURCE_MBPS:
+                time.sleep(_source_turn(len(chunk)))
+            if time.time() - last >= SOURCE_SEEN_EVERY:
+                remote_worker.touch_seen(job_dir)
+                last = time.time()
+    remote_worker.touch_seen(job_dir)
 
 
 @app.post("/internal/worker/jobs/{job_id}/log")
@@ -5389,14 +5506,15 @@ async def _validate_source_url(url: str):
             "(youtube.com/watch?v=... or youtu.be/...)."))
 
 
-async def _quality_gate(url: str, force_low: bool):
+async def _quality_gate(url: str, force_low: bool, *, skip_short_source: bool = False):
     """Run the pre-flight probe: raises 400 for a too-short source, returns
     the needs_confirmation response for a low-resolution one, else None."""
     probe = await _probe_youtube_quality(url)
     # Hard reject, no confirm-and-retry: a too-short source fails the same
     # way on every retry, so letting the user force it just burns the job.
     source_duration = int(probe.get("duration") or 0)
-    if MIN_SOURCE_SECONDS > 0 and 0 < source_duration < MIN_SOURCE_SECONDS:
+    if (not skip_short_source and MIN_SOURCE_SECONDS > 0
+            and 0 < source_duration < MIN_SOURCE_SECONDS):
         _reject_short_source(source_duration)
     max_height = int(probe.get("max_height") or 0)
     if not force_low and QUALITY_GATE_MIN_HEIGHT > 0 \
@@ -5459,6 +5577,27 @@ def _reject_short_source(duration: float):
         f"This video is only {int(duration)}s long — clip generation needs at "
         f"least {MIN_SOURCE_SECONDS}s of material to cut from. It already is "
         f"short-form content."))
+
+
+def _compose_merge_job(
+    compose_list: List[str],
+    compose_uploads: List,
+    *,
+    music_url: Optional[str],
+    music_file: Optional[UploadFile],
+    mute_source: bool,
+) -> bool:
+    """True when the job merges multiple inputs (URLs/files/music), not one long take."""
+    n = len(compose_list) + len(compose_uploads)
+    if n < 1:
+        return False
+    return (
+        n > 1
+        or bool(compose_uploads)
+        or bool(music_url)
+        or bool(music_file and music_file.filename)
+        or mute_source
+    )
 
 
 # Layouts the caller can let the renderer choose from, mapped to the env var
@@ -5655,6 +5794,10 @@ class EstimateRequest(BaseModel):
     seconds: Optional[float] = None  # a local file: the browser read its duration
 
 
+
+# The cost line under the link box waits at most this long for the probe.
+ESTIMATE_PROBE_TIMEOUT = _int_env("ESTIMATE_PROBE_TIMEOUT", 20)
+
 @app.post("/api/process/estimate")
 async def process_estimate(req: EstimateRequest, request: Request):
     """Cost line for the dashboard: what this source would cost before it runs.
@@ -5679,8 +5822,12 @@ async def process_estimate(req: EstimateRequest, request: Request):
             _check_probe_rate(f"estimate:{user.id}")
             loop = asyncio.get_event_loop()
             try:
-                minutes = await loop.run_in_executor(
-                    None, functools.partial(_metering.probe_url_minutes, url, allow_paid=False))
+                minutes = await asyncio.wait_for(
+                    _metering.run_probe(url, allow_paid=False), ESTIMATE_PROBE_TIMEOUT)
+            except asyncio.TimeoutError:
+                # Only the cost line waits on it: without a number the page
+                # says nothing, and the submit probes for itself.
+                return {"billing": True, "outcome": None}
             except Exception as e:
                 from yt_clients import NotASingleVideo
                 if isinstance(e, NotASingleVideo):
@@ -5717,6 +5864,10 @@ async def process_endpoint(
     clip_min_seconds: Optional[str] = Form(None),
     clip_max_seconds: Optional[str] = Form(None),
     clip_brief: Optional[str] = Form(None),
+    video_urls: Optional[str] = Form(None),
+    music_url: Optional[str] = Form(None),
+    mute_source: Optional[str] = Form(None),
+    multi_source: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
     auto_hook_style: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
@@ -5725,6 +5876,8 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    compose_videos: List[UploadFile] = File(default=[]),
+    music_file: Optional[UploadFile] = File(default=None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -5752,6 +5905,9 @@ async def process_endpoint(
         clip_min_seconds = body.get("clip_min_seconds")
         clip_max_seconds = body.get("clip_max_seconds")
         clip_brief = body.get("clip_brief")
+        video_urls = body.get("video_urls")
+        music_url = body.get("music_url")
+        mute_source = body.get("mute_source")
         auto_hook = body.get("auto_hook")
         auto_hook_style = body.get("auto_hook_style")
         thumbnail_session_id = body.get("thumbnail_session_id")
@@ -5789,7 +5945,28 @@ async def process_endpoint(
     if upload_id and not url and not file and not thumb_session:
         upload_slot = _take_pending_upload(upload_id, await _owner_id(request))
 
-    if not url and not file and not thumb_session and not upload_slot:
+    compose_list = source_compose.parse_video_url_list(video_urls)
+    if url and not compose_list:
+        compose_list = [url.strip()]
+    elif url and compose_list and url.strip() not in compose_list:
+        compose_list = [url.strip(), *compose_list]
+    music_url = (music_url or "").strip() or None
+    mute_source_flag = str(mute_source or "").lower() in ("1", "true", "yes")
+
+    compose_uploads = [u for u in (compose_videos or []) if u.filename]
+    # Multi-source multipart: a misrouted sole `file` field still counts as compose.
+    multi_source_flag = str(multi_source or "").lower() in ("1", "true", "yes")
+    if (file and file.filename and not compose_uploads
+            and (multi_source_flag or compose_list or music_url or mute_source_flag
+                 or (music_file and music_file.filename) or video_urls)):
+        compose_uploads = [file]
+        file = None
+    compose_merge = _compose_merge_job(
+        compose_list, compose_uploads,
+        music_url=music_url, music_file=music_file, mute_source=mute_source_flag,
+    ) or multi_source_flag
+    if (not compose_list and not file and not thumb_session and not upload_slot
+            and not compose_uploads):
         raise HTTPException(status_code=400, detail="Must provide URL, File or upload_id")
 
     # Completion callback: reject unsafe targets NOW (clear 400) — delivery
@@ -5811,8 +5988,10 @@ async def process_endpoint(
     # Refuse a URL no server-side fetch may touch before anything fetches it:
     # the quality probe below used to run yt-dlp on it unvalidated (tailnet
     # hosts included) and ahead of the balance / rate checks.
-    if url:
-        await _validate_source_url(url)
+    for src_url in compose_list:
+        await _validate_source_url(src_url)
+    if music_url:
+        await _validate_source_url(music_url)
 
     # Capture attestation context for legal record (IP + timestamp + UA)
     client_ip = request.client.host if request.client else "unknown"
@@ -5826,7 +6005,11 @@ async def process_endpoint(
         "user_agent": user_agent,
         "timestamp": time.time(),
         "source": ("thumbnail_session" if thumb_session else "upload_id" if upload_slot
-                   else "url" if url else "file"),
+                   else "compose" if (len(compose_list) > 1 or compose_uploads
+                                      or music_url
+                                      or (music_file and music_file.filename)
+                                      or mute_source_flag)
+                   else "url" if compose_list else "file"),
     }
 
     job_id = str(uuid.uuid4())
@@ -5915,12 +6098,66 @@ async def process_endpoint(
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
 
+    local_video_paths: List[str] = []
+    compose_music_path = None
+    upload_limit = MAX_FILE_SIZE_MB * 1024 * 1024
+
+    async def _save_upload(uf: UploadFile, dest: str) -> None:
+        size = 0
+        with open(dest, "wb") as buffer:
+            while content := await uf.read(1024 * 1024):
+                size += len(content)
+                if size > upload_limit:
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        pass
+                    shutil.rmtree(job_output_dir, ignore_errors=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB",
+                    )
+                buffer.write(content)
+
+    for i, uf in enumerate(compose_uploads):
+        safe_name = _clamp_upload_name(
+            os.path.basename(uf.filename or "") or f"video_{i}.mp4")
+        dest = os.path.join(job_output_dir, f"compose_{i}_{safe_name}")
+        await _save_upload(uf, dest)
+        local_video_paths.append(dest)
+
+    if music_file and music_file.filename:
+        safe = _clamp_upload_name(os.path.basename(music_file.filename) or "music.mp3")
+        compose_music_path = os.path.join(job_output_dir, f"compose_music_{safe}")
+        await _save_upload(music_file, compose_music_path)
+
     input_path = None
-    if url:
-        # Keep the downloaded source inside the job dir: the clip editor's
-        # re-render path cuts new segments from it, and it ages out with the
-        # rest of the job (retention window + OUTPUT_MAX_GB cap) either way.
-        cmd.extend(["-u", url, "--keep-original"])
+    n_sources = len(compose_list) + len(local_video_paths)
+    use_compose = n_sources > 0 and (
+        n_sources > 1 or local_video_paths or music_url or compose_music_path or mute_source_flag)
+    if (compose_list or local_video_paths) and use_compose:
+        compose_path = os.path.join(job_output_dir, ".compose.json")
+        with open(compose_path, "w", encoding="utf-8") as cf:
+            json.dump({
+                "video_urls": compose_list,
+                "local_video_paths": local_video_paths,
+                "music_url": music_url,
+                "music_path": compose_music_path,
+                "mute_video": mute_source_flag,
+                "output_format": output_format or "auto",
+            }, cf)
+        cmd.extend(["--compose-spec", compose_path, "--keep-original"])
+        if local_video_paths:
+            input_path = local_video_paths[0]
+            if len(local_video_paths) > 1:
+                est = sum(_media_duration_seconds(p) for p in local_video_paths)
+                if est > 0:
+                    request.state.compose_source_seconds = est
+        if compose_list:
+            url = compose_list[0]  # metering / self-host segment planner
+    elif compose_list:
+        cmd.extend(["-u", compose_list[0], "--keep-original"])
+        url = compose_list[0]
     elif thumb_session:
         # Hardlink (or copy) the session's video under the job's name so source
         # lookup, the clip editor and the preview treat it exactly like a normal
@@ -5955,7 +6192,7 @@ async def process_endpoint(
         os.replace(src, input_path)
         pending_uploads.pop(upload_id, None)
         cmd.extend(["-i", input_path])
-    else:
+    elif file and file.filename:
         # Save uploaded file with size limit check.
         # basename() strips any path components from the client-supplied
         # filename so a name like "../../main.py" can't escape UPLOAD_DIR.
@@ -5982,6 +6219,9 @@ async def process_endpoint(
             _reject_short_source(upload_duration)
 
         cmd.extend(["-i", input_path])
+    else:
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Must provide URL, File or upload_id")
 
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
@@ -6021,7 +6261,8 @@ async def process_endpoint(
     # rejection hands the reservation back.
     if url and (QUALITY_GATE_MIN_HEIGHT > 0 or MIN_SOURCE_SECONDS > 0):
         try:
-            gate = await _quality_gate(url, force_low)
+            gate = await _quality_gate(
+                url, force_low, skip_short_source=compose_merge)
         except BaseException:
             await _drop_unstarted_job(reservation_id, job_output_dir)
             raise
@@ -6223,7 +6464,49 @@ async def get_status(job_id: str, request: Request):
     }
     if job.get('status') == 'failed':
         out["error"] = _job_error_text(list(job.get('logs') or []))[-500:]
+    previews = _compose_preview_parts(job_id)
+    if previews:
+        out["compose_previews"] = previews
+    if _locate_source(job_id):
+        out["source_preview_url"] = _signed_source_url(job_id)
     return out
+
+
+def _compose_preview_parts(job_id: str) -> List[dict]:
+    """Per-segment Live Analysis while multi-source compose is still downloading."""
+    prog = os.path.join(OUTPUT_DIR, job_id, ".compose_progress.json")
+    if not os.path.isfile(prog):
+        return []
+    try:
+        with open(prog, encoding="utf-8") as f:
+            parts = (json.load(f) or {}).get("parts") or []
+    except (json.JSONDecodeError, OSError):
+        return []
+    out: List[dict] = []
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    for p in parts:
+        name = os.path.basename(str(p.get("file") or ""))
+        if not name or not os.path.isfile(os.path.join(job_dir, name)):
+            continue
+        out.append({
+            "index": p.get("index"),
+            "title": p.get("title"),
+            "stage": p.get("stage"),
+            "file": name,
+            "url": _signed_compose_part_url(job_id, name),
+        })
+    return out
+
+
+def _signed_compose_part_url(job_id: str, basename: str) -> str:
+    base = f"/api/source/{job_id}?part={urllib.parse.quote(basename)}"
+    if not BILLING_ENABLED:
+        return base
+    exp = int(time.time()) + SOURCE_URL_TTL_SECONDS
+    msg = f"{job_id}:{basename}:{exp}"
+    secret = (_cloud_config.settings.jwt_secret if BILLING_ENABLED else "") or ""
+    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{base}&exp={exp}&sig={sig}"
 
 
 def _locate_source(job_id: str):
@@ -6233,6 +6516,9 @@ def _locate_source(job_id: str):
     the job dir (--keep-original) under the name recorded as ``source_video``
     in metadata.json. Either way it ages out with the normal retention caps.
     """
+    combined = source_compose.combined_source_path(os.path.join(OUTPUT_DIR, job_id))
+    if os.path.isfile(combined):
+        return combined
     matches = [
         f for f in glob.glob(os.path.join(UPLOAD_DIR, f"{glob.escape(job_id)}_*"))
         if not os.path.basename(f).startswith("thumb_")
@@ -6311,7 +6597,8 @@ async def get_source_url(job_id: str, request: Request):
 
 @app.get("/api/source/{job_id}")
 async def get_source_video(job_id: str, request: Request,
-                           exp: int = 0, sig: str = ""):
+                           exp: int = 0, sig: str = "",
+                           part: Optional[str] = None):
     """Stream a job's original source video for the live-analysis preview and
     the clip editor's source monitor.
 
@@ -6324,11 +6611,17 @@ async def get_source_video(job_id: str, request: Request,
     a bearer token on the request. Self-host and ownerless BYOK jobs are
     unchanged: there is no owner to check and no secret to sign with.
     """
-    signed = (
-        BILLING_ENABLED and sig
-        and exp > time.time()
-        and hmac.compare_digest(sig, _source_signature(job_id, exp))
+    part_name = os.path.basename(part or "").strip() if part else ""
+    sig_ok = (
+        BILLING_ENABLED and sig and exp > time.time()
+        and (hmac.compare_digest(sig, _source_signature(job_id, exp))
+             or (part_name and hmac.compare_digest(
+                 sig, hmac.new(
+                     (_cloud_config.settings.jwt_secret or "").encode(),
+                     f"{job_id}:{part_name}:{exp}".encode(),
+                     hashlib.sha256).hexdigest()[:32])))
     )
+    signed = sig_ok
     # Gated on BILLING_ENABLED, not just on `signed`: _job_record falls through
     # to _job_view_from_disk, which rescans the whole output directory. Off
     # billing there is no owner to find, so that scan would run on every single
@@ -6341,9 +6634,16 @@ async def get_source_video(job_id: str, request: Request,
             # The job folder can be gone (size cap, sweep) while uploads/<id>_*
             # is still there: the owner then comes from .owner / the Project row.
             await _assert_disk_job_owner(request, job_id)
-    source_path = _locate_source(job_id)
-    if not source_path:
-        raise HTTPException(status_code=404, detail="Source not found")
+    if part_name:
+        candidate = os.path.join(OUTPUT_DIR, job_id, part_name)
+        if os.path.isfile(candidate):
+            source_path = candidate
+        else:
+            raise HTTPException(status_code=404, detail="Source part not found")
+    else:
+        source_path = _locate_source(job_id)
+        if not source_path:
+            raise HTTPException(status_code=404, detail="Source not found")
     return FileResponse(source_path, media_type="video/mp4")
 
 
@@ -8326,7 +8626,7 @@ class SocialPostRequest(BaseModel):
     clip_index: int
     api_key: Optional[str] = None  # BYOK; ignored for managed users
     user_id: Optional[str] = None  # BYOK profile; ignored for managed users
-    platforms: List[str] # ["tiktok", "instagram", "youtube"]
+    platforms: List[str]  # social_platforms.PLATFORMS
     # Optional overrides if frontend wants to edit them
     title: Optional[str] = None
     description: Optional[str] = None
@@ -8345,18 +8645,18 @@ def _post_video_blocking(url, headers, data, file_path, filename, timeout):
         return client.post(url, headers=headers, data=data, files=files)
 
 
-# YouTube refuses a title over 100 characters; the Gemini title is not bounded.
-YOUTUBE_TITLE_MAX = 100
+import social_platforms
+from social_platforms import YOUTUBE_TITLE_MAX, youtube_title  # noqa: F401  (re-exported)
 
 
-def youtube_title(title) -> str:
-    """``title`` cut to YouTube's limit, on a word boundary when there is one."""
-    t = " ".join(str(title or "").split())
-    if len(t) <= YOUTUBE_TITLE_MAX:
-        return t
-    cut = t[:YOUTUBE_TITLE_MAX]
-    space = cut.rfind(" ")
-    return (cut[:space] if space >= YOUTUBE_TITLE_MAX // 2 else cut).rstrip(" ,.;:-")
+def _checked_platforms(platforms) -> List[str]:
+    """The request's platforms, or a 400 naming the ones OpenShorts does not post to."""
+    bad = social_platforms.unknown(platforms)
+    if bad or not platforms:
+        raise HTTPException(status_code=400, detail=(
+            f"Unsupported platform: {', '.join(map(str, bad))}. " if bad else "No platform chosen. ")
+            + f"Choose from {', '.join(social_platforms.PLATFORMS)}.")
+    return social_platforms.clean(platforms)
 
 
 # Async uploads started here, so the status proxy below only ever answers the
@@ -8418,6 +8718,7 @@ async def _check_social_post_rate(request):
 
 @app.post("/api/social/post")
 async def post_to_socials(req: SocialPostRequest, request: Request):
+    req.platforms = _checked_platforms(req.platforms)
     await _ensure_job_files(req.job_id, request)
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -8429,7 +8730,10 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
     post_user = resolve_post_profile(forced_profile, req.user_id)
 
-    job = jobs[req.job_id]
+    # The awaits above can let cleanup or an account delete drop the job.
+    job = jobs.get(req.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     await _assert_job_owner(request, job)
     if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
@@ -8440,7 +8744,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         if stale:
             print(f"[social-post-failed] request=none platform={','.join(stale)} "
                   f"status=reauth_required message='refused before upload: reconnect needed'")
-            names = ", ".join(p.capitalize() if p != "youtube" else "YouTube" for p in stale)
+            names = ", ".join(social_platforms.label(p) for p in stale)
             raise HTTPException(status_code=409, detail=(
                 f"Reconnect {names} first: its login has expired, so the post would "
                 "fail. Use \"connect socials\" and try again."))
@@ -8483,20 +8787,10 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
             if req.timezone:
                 data_payload["timezone"] = req.timezone
         
-        # Add Platform specifics
-        if "tiktok" in req.platforms:
-             data_payload["tiktok_title"] = final_description
-             data_payload["post_mode"] = TIKTOK_POST_MODE
-             
-        if "instagram" in req.platforms:
-             data_payload["instagram_title"] = final_description
-             data_payload["media_type"] = "REELS"
-
-        if "youtube" in req.platforms:
-             yt_title = req.title or clip.get('video_title_for_youtube_short', final_title)
-             data_payload["youtube_title"] = youtube_title(yt_title)
-             data_payload["youtube_description"] = final_description
-             data_payload["privacyStatus"] = "public"
+        data_payload.update(social_platforms.upload_fields(
+            req.platforms, title=final_title, description=final_description,
+            yt_title=req.title or clip.get('video_title_for_youtube_short', final_title),
+            tiktok_post_mode=TIKTOK_POST_MODE))
 
         # The upload is a blocking multipart POST of the whole clip (tens of
         # seconds for TikTok+YouTube). Run inline, it froze the event loop:
@@ -8538,7 +8832,7 @@ async def social_post_status(request_id: str, request: Request):
     upload_key, _ = await resolve_upload_post(request, None)
     if not upload_key:
         return {"status": "unknown"}
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with social_platforms.upload_post_client(20.0) as client:
         try:
             resp = await client.get("https://api.upload-post.com/api/uploadposts/status",
                                     headers={"Authorization": f"Apikey {upload_key}"},
@@ -8581,7 +8875,7 @@ def _log_post_failures(request_id, status, results):
         print(f"[social-post-failed] request={request_id} platform={r.get('platform')} "
               f"status={status} message={msg!r}")
 
-SOCIAL_PLATFORMS = ("tiktok", "instagram", "youtube")
+SOCIAL_PLATFORMS = social_platforms.PLATFORMS
 
 
 async def _managed_social_user(request, api_key, profile):
@@ -8593,7 +8887,7 @@ async def _managed_social_user(request, api_key, profile):
         user = await _user_from_request(request)
         name = cloud.social_profiles.profile_username_for(user.id)
         return {"profiles": [{"username": name, "connected": []}]}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         resp = await client.get(f"https://api.upload-post.com/api/uploadposts/users/{profile}",
                                 headers={"Authorization": f"Apikey {api_key}"})
     if resp.status_code == 404:
@@ -8624,7 +8918,7 @@ async def get_social_user(request: Request):
     print(f"🔍 Fetching User ID from: {url}")
     headers = {"Authorization": f"Apikey {api_key}"}
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         try:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
@@ -8650,7 +8944,7 @@ async def get_social_user(request: Request):
                              socials = p.get('social_accounts', {})
                              connected = []
                              # Check typical platforms
-                             for platform in ['tiktok', 'instagram', 'youtube']:
+                             for platform in SOCIAL_PLATFORMS:
                                  account_info = socials.get(platform)
                                  # If it's a dict and typically has data, or just not empty string
                                  if isinstance(account_info, dict):
@@ -8715,7 +9009,7 @@ async def _social_analytics_auth(request: Request, byok_profile: Optional[str]):
 
 async def _upload_post_get(api_key: str, url: str, params: dict):
     headers = {"Authorization": f"Apikey {api_key}"}
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with social_platforms.upload_post_client(60.0) as client:
         resp = await client.get(url, headers=headers, params=params)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Vendor API Error: {resp.text}")
@@ -8919,7 +9213,7 @@ async def social_cancel_scheduled(job_id: str, request: Request, user: Optional[
         # 404 rather than 403: never confirm that someone else's job exists.
         raise HTTPException(status_code=404, detail="Scheduled post not found")
     headers = {"Authorization": f"Apikey {api_key}"}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         resp = await client.delete(
             f"https://api.upload-post.com/api/uploadposts/schedule/{job_id}",
             headers=headers)
@@ -8973,8 +9267,7 @@ async def _probe_thumbnail_url(request, url, user):
     paid_allowed = not await _paid_proxy_budget_exceeded()
     loop = asyncio.get_event_loop()
     try:
-        minutes = await loop.run_in_executor(
-            None, functools.partial(_metering.probe_url_minutes, url, allow_paid=paid_allowed))
+        minutes = await _metering.run_probe(url, allow_paid=paid_allowed)
     except Exception as e:
         from yt_clients import NotASingleVideo
         if isinstance(e, NotASingleVideo):
@@ -9951,6 +10244,7 @@ class SaaSPostRequest(BaseModel):
 @app.post("/api/saasshorts/post")
 async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
     """Post an AI Shorts video to social media via Upload-Post."""
+    req.platforms = _checked_platforms(req.platforms)
     if req.job_id not in saas_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -9996,16 +10290,9 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
             if req.timezone:
                 data_payload["timezone"] = req.timezone
 
-        if "tiktok" in req.platforms:
-            data_payload["tiktok_title"] = final_description
-            data_payload["post_mode"] = TIKTOK_POST_MODE
-        if "instagram" in req.platforms:
-            data_payload["instagram_title"] = final_description
-            data_payload["media_type"] = "REELS"
-        if "youtube" in req.platforms:
-            data_payload["youtube_title"] = youtube_title(final_title)
-            data_payload["youtube_description"] = final_description
-            data_payload["privacyStatus"] = "public"
+        data_payload.update(social_platforms.upload_fields(
+            req.platforms, title=final_title, description=final_description,
+            tiktok_post_mode=TIKTOK_POST_MODE))
 
         filename = os.path.basename(file_path)
         print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")

@@ -2023,7 +2023,8 @@ def _run_gemini_stage(client, model_name, prompt, schema):
         response_mime_type="application/json",
         response_schema=schema,
     )
-    max_attempts = 3
+    # Local servers (Ollama on CPU) hit more blips; extra attempts + backoff.
+    max_attempts = 5 if use_local else 3
     for attempt in range(1, max_attempts + 1):
         try:
             if use_local:
@@ -2048,18 +2049,10 @@ def _run_gemini_stage(client, model_name, prompt, schema):
             raise  # deterministic policy block — never retry
         except Exception as e:
             msg = str(e)
-            transient = any(tok in msg for tok in (
-                '503', 'UNAVAILABLE', '429', 'RESOURCE_EXHAUSTED',
-                '500', 'INTERNAL', 'overloaded', 'Deadline',
-                'empty response body', 'did not contain a JSON object',
-                'Failed to parse Gemini JSON response',
-                # OpenAI-compatible servers: model still loading, busy, or a
-                # small model that skipped a required field this time.
-                'ConnectError', 'ReadTimeout', 'RemoteProtocolError', '502', '504',
-                'validation error'))
+            transient = llm_backend.is_transient_error(e)
             if attempt == max_attempts or not transient:
                 raise
-            wait = 5 * (2 ** (attempt - 1))
+            wait = (10 if use_local else 5) * (2 ** (attempt - 1))
             who = "LLM server" if use_local else "Gemini"
             print(f"⚠️ {who} transient error (attempt {attempt}/{max_attempts}), retrying in {wait}s: {msg[:150]}")
             time.sleep(wait)
@@ -2298,7 +2291,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         print(f"🚫 {e}")
         raise
     except Exception as e:
-        print(f"❌ Gemini Error: {e}")
+        who = "LLM" if llm_backend.active() else "Gemini"
+        print(f"❌ {who} Error: {e}")
         return None
 
 
@@ -2538,6 +2532,8 @@ if __name__ == '__main__':
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('-i', '--input', type=str, help="Path to the input video file.")
     input_group.add_argument('-u', '--url', type=str, help="YouTube URL to download and process.")
+    input_group.add_argument('--compose-spec', type=str,
+                             help="JSON file with video_urls, optional music_url and mute_video.")
     
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
     parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
@@ -2619,11 +2615,70 @@ if __name__ == '__main__':
     # without TWITCH_CLIENT_ID). A URL call, so it runs before the download and
     # the early pick below gets it too.
     viewer_clips = []
-    if args.url and not args.skip_analysis and not args.prepare_only:
-        viewer_clips = twitch_signals.viewer_clips_for_job(args.url, 0)
+    primary_url = args.url
+    if not primary_url and getattr(args, "compose_spec", None):
+        import source_compose
+        try:
+            spec = source_compose.load_compose_spec(args.compose_spec)
+            urls = source_compose.parse_video_url_list(spec.get("video_urls"))
+            primary_url = urls[0] if urls else None
+        except Exception:
+            primary_url = None
+    if primary_url and not args.skip_analysis and not args.prepare_only:
+        viewer_clips = twitch_signals.viewer_clips_for_job(primary_url, 0)
 
     # 1. Get Input Video
-    if args.url:
+    if getattr(args, "compose_spec", None):
+        import source_compose
+        if args.output and not args.skip_analysis:
+            output_dir = _ensure_dir(args.output)
+        elif args.output and os.path.isdir(args.output):
+            output_dir = args.output
+        elif args.output:
+            output_dir = os.path.dirname(args.output) or "."
+        else:
+            output_dir = "."
+        spec = source_compose.load_compose_spec(args.compose_spec)
+        early = {"lock": threading.Lock(), "done": threading.Event(), "started": False,
+                 "abandoned": False, "invalid": False, "transcript": None, "clips": None}
+
+        def _early_work(audio_path, audio_duration):
+            try:
+                t = transcribe_video(audio_path)
+                early["transcript"] = t
+                if audio_duration and not speech_is_sparse(t, audio_duration):
+                    early["clips"] = get_viral_clips(t, audio_duration,
+                                                     viewer_clips=viewer_clips)
+            except Exception as e:
+                print(f"   ℹ️ Early transcription skipped ({type(e).__name__}: {e}).")
+                early["transcript"] = early["clips"] = None
+            finally:
+                early["done"].set()
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    pass
+
+        def _on_audio(audio_path, audio_duration):
+            with early["lock"]:
+                if early["abandoned"]:
+                    return
+                early["started"] = True
+            threading.Thread(target=_early_work, args=(audio_path, audio_duration),
+                             daemon=True).start()
+
+        use_early = (not args.skip_analysis and not args.transcript
+                     and not args.prepare_only
+                     and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
+                     and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
+                     and not spec.get("mute_video")
+                     and not spec.get("music_url")
+                     and not (spec.get("music_path") or "").strip()
+                     and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
+        input_video, video_title = source_compose.build_combined_source(
+            spec, output_dir, download_youtube_video,
+            on_audio=_on_audio if use_early else None)
+    elif args.url:
         # For multi-clip runs, treat --output as an OUTPUT DIRECTORY (create it if needed).
         # For whole-video runs (--skip-analysis), --output can be a file path.
         if args.output and not args.skip_analysis:

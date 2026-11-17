@@ -34,6 +34,15 @@ that timestamp (`self_host_source.py`); the ranged file is not cut again from
 `SOURCE_START_SECONDS` (`main.py`). No manual segment file or API job is
 required — use Video URL in the dashboard, then edit clips in the UI.
 
+**Multi-source (dashboard “Multi-source” tab):** video URLs and/or local MP4s (plus
+optional soundtrack) are merged into one timeline; per-clip length limits do not
+apply to each part — only the merged source is analyzed for viral moments. Several video URLs are downloaded
+in order, optionally muted, merged with `source_compose.py`, and optionally
+overlaid with a separate music URL. The combined file is transcribed once and
+`get_viral_clips` / the local LLM scores windows across the full timeline — use
+`clip_brief` to steer toward shocking or high-energy moments. Finished clips
+still support per-clip AI effects preview in the editor (`ResultCard`).
+
 ## Silent footage: the vision fallback (`main.get_visual_clips`)
 
 `transcribe_video` raising `NoAudioError`, **or** `speech_is_sparse()` returning

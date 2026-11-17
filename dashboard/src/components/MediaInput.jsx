@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-react';
+import { Link2, Upload, FileVideo, FileAudio, X, Info, Loader2, ChevronDown } from 'lucide-react';
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
 import SourceCost from './SourceCost';
@@ -14,6 +14,22 @@ const SUPPORTED_PLATFORMS = [
 // says so the moment the file is picked (a 27 s upload used to end in a bare
 // "That run failed").
 const MIN_SOURCE_SECONDS = 45;
+
+const VIDEO_NAME_RE = /\.(mp4|mov|m4v|webm|mkv|avi)$/i;
+const AUDIO_NAME_RE = /\.(mp3|m4a|wav|aac|flac|ogg)$/i;
+
+function isVideoFile(f) {
+    return Boolean(f && (f.type?.startsWith('video/') || VIDEO_NAME_RE.test(f.name || '')));
+}
+
+function isAudioFile(f) {
+    return Boolean(f && (f.type?.startsWith('audio/') || AUDIO_NAME_RE.test(f.name || '')));
+}
+
+/** Local soundtrack: audio files or video containers we mux audio from (ffmpeg -vn). */
+function isSoundtrackFile(f) {
+    return Boolean(f && (isAudioFile(f) || /\.(mp4|mov|m4v)$/i.test(f.name || '')));
+}
 
 // Duration of a local video file in seconds, or null when the browser cannot
 // read it (unsupported codec): then the server stays the judge.
@@ -51,8 +67,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     const [selfHostSegmentMin, setSelfHostSegmentMin] = useState(null);
     // File upload is the primary path; the link is secondary.
-    const [mode, setMode] = useState('file'); // 'file' | 'url'
+    const [mode, setMode] = useState('file'); // 'file' | 'url' | 'multi'
     const [url, setUrl] = useState('');
+    const [multiUrls, setMultiUrls] = useState('');
+    const [musicUrl, setMusicUrl] = useState('');
+    const [multiVideoFiles, setMultiVideoFiles] = useState([]);
+    const [musicFile, setMusicFile] = useState(null);
+    const [muteSource, setMuteSource] = useState(false);
     const [file, setFile] = useState(null);
     const [fileSeconds, setFileSeconds] = useState(null);
     const fileTooShort = fileSeconds != null && fileSeconds < MIN_SOURCE_SECONDS;
@@ -160,24 +181,78 @@ export default function MediaInput({ onProcess, isProcessing }) {
             localStorage.setItem('os_layout', layout);
             localStorage.setItem('os_clip_brief', clipBrief);
         } catch { /* ignore */ }
-        if (mode === 'url' && url) {
+        if (mode === 'multi') {
+            const videoUrls = multiUrls.split(/\n|,/).map((l) => l.trim()).filter(Boolean);
+            if (videoUrls.length < 1 && multiVideoFiles.length < 1) return;
+            onProcess({
+                type: 'multi_compose',
+                videoUrls,
+                multiVideoFiles,
+                musicFile,
+                musicUrl: musicUrl.trim() || null,
+                muteSource,
+                acknowledged: true,
+                outputFormat,
+                ...advanced,
+            });
+        } else if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
         } else if (mode === 'file' && file && !fileTooShort) {
             onProcess({ type: 'file', payload: file, acknowledged: true, outputFormat, ...advanced });
         }
     };
 
+    const multiUrlCount = multiUrls.split(/\n|,/).map((l) => l.trim()).filter(Boolean).length;
+    const multiSourceCount = multiUrlCount + multiVideoFiles.length;
+    const maxMultiVideos = 12;
+
+    const addMultiVideoFiles = (incoming) => {
+        const vids = [...incoming].filter(isVideoFile);
+        if (!vids.length) return;
+        setMultiVideoFiles((prev) => {
+            const room = maxMultiVideos - multiUrlCount - prev.length;
+            return [...prev, ...vids.slice(0, Math.max(0, room))];
+        });
+    };
+
+    const handleMultiVideoDrop = (e) => {
+        e.preventDefault();
+        if (e.dataTransfer.files?.length) addMultiVideoFiles(e.dataTransfer.files);
+    };
+
+    const handleMultiMusicDrop = (e) => {
+        e.preventDefault();
+        const f = e.dataTransfer.files?.[0];
+        if (isSoundtrackFile(f)) setMusicFile(f);
+    };
+
+    const handleMultiPaneDrop = (e) => {
+        e.preventDefault();
+        const files = [...(e.dataTransfer.files || [])];
+        const vids = files.filter(isVideoFile);
+        const audios = files.filter(isAudioFile);
+        if (vids.length) addMultiVideoFiles(vids);
+        if (audios.length) setMusicFile(audios[0]);
+    };
+
     const handleDrop = (e) => {
         e.preventDefault();
+        if (mode === 'multi') {
+            handleMultiPaneDrop(e);
+            return;
+        }
         if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-            setFile(e.dataTransfer.files[0]);
-            setMode('file');
+            const f = e.dataTransfer.files[0];
+            if (isVideoFile(f)) {
+                setFile(f);
+                setMode('file');
+            }
         }
     };
 
     return (
         <div className="card p-4 sm:p-6 animate-fade">
-            <div className="flex gap-4 sm:gap-6 mb-6 border-b border-rule" data-tutorial="source-tabs">
+            <div className="flex flex-nowrap gap-4 sm:gap-6 mb-6 border-b border-rule overflow-x-auto" data-tutorial="source-tabs">
                 <button
                     onClick={() => setMode('file')}
                     className={`flex items-center gap-2 pb-3 px-1 -mb-px border-b-2 text-sm lowercase whitespace-nowrap transition-colors ${mode === 'file'
@@ -200,10 +275,168 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         Video URL
                     </button>
                 )}
+                <button
+                    onClick={() => setMode('multi')}
+                    className={`flex items-center gap-2 pb-3 px-1 -mb-px border-b-2 text-sm lowercase whitespace-nowrap transition-colors ${mode === 'multi'
+                        ? 'text-ink border-brass'
+                        : 'text-muted border-transparent hover:text-ink2'
+                        }`}
+                >
+                    <Upload size={16} className={`hidden sm:block ${mode === 'multi' ? 'text-brass' : ''}`} />
+                    Multi-source
+                </button>
             </div>
 
-            <form onSubmit={handleSubmit}>
-                {mode === 'url' ? (
+            <form
+                onSubmit={handleSubmit}
+                onDragOver={(e) => { if (mode === 'multi') e.preventDefault(); }}
+                onDrop={(e) => {
+                    if (mode !== 'multi') return;
+                    e.preventDefault();
+                    handleMultiPaneDrop(e);
+                }}
+            >
+                {mode === 'multi' ? (
+                    <div
+                        className="space-y-4"
+                        data-tutorial="drop-zone"
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={handleMultiPaneDrop}
+                    >
+                        <div
+                            className={`border-2 border-dashed rounded-card p-5 text-center transition-colors ${multiVideoFiles.length ? 'border-brass' : 'border-rule2 hover:border-brass'}`}
+                            onDragOver={(e) => e.preventDefault()}
+                            onDrop={(e) => { e.stopPropagation(); handleMultiVideoDrop(e); }}
+                        >
+                            <label className="cursor-pointer block">
+                                <input
+                                    type="file"
+                                    accept="video/*,.mp4,.mov"
+                                    multiple
+                                    onChange={(e) => {
+                                        if (e.target.files?.length) addMultiVideoFiles(e.target.files);
+                                        e.target.value = '';
+                                    }}
+                                    className="hidden"
+                                />
+                                <Upload className="mx-auto mb-2 text-muted" size={18} />
+                                <p className="text-ink2 lowercase text-sm">Drop MP4/MOV clips here or click to add</p>
+                                <p className="readout mt-1">Local files are concatenated after any URLs below · up to {maxMultiVideos} total</p>
+                            </label>
+                            {multiVideoFiles.length > 0 && (
+                                <ul className="mt-4 space-y-2 text-left">
+                                    {multiVideoFiles.map((f, i) => (
+                                        <li key={`${f.name}-${i}`} className="flex items-center gap-2 text-sm min-w-0">
+                                            <FileVideo size={16} className="shrink-0 text-ok" />
+                                            <span className="truncate">{f.name}</span>
+                                            <button
+                                                type="button"
+                                                onClick={() => setMultiVideoFiles((prev) => prev.filter((_, j) => j !== i))}
+                                                className="ml-auto p-1 text-muted hover:text-ink rounded-full"
+                                                aria-label={`Remove ${f.name}`}
+                                            >
+                                                <X size={14} />
+                                            </button>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+                        <div>
+                            <p className="eyebrow mb-1.5">video URLs (optional, one per line)</p>
+                            <textarea
+                                value={multiUrls}
+                                onChange={(e) => setMultiUrls(e.target.value)}
+                                rows={4}
+                                placeholder={youtubeUrlEnabled ? 'https://youtu.be/...\n(optional — mix with files above)' : '(optional — URLs disabled on this host)'}
+                                className="input-field resize-y min-h-[5rem] text-sm font-mono"
+                                disabled={!youtubeUrlEnabled}
+                            />
+                            <p className="text-xs text-muted mt-2 leading-relaxed">
+                                URLs download first, then local files, in order. Short clips are fine — they are merged into
+                                one timeline; viral moments are picked from the combined video (same rules as a long upload).
+                                Use the clip brief below for hooks like &quot;shocking reveals&quot;.
+                            </p>
+                        </div>
+                        <div className="grid gap-4 sm:grid-cols-2">
+                            <div>
+                                <p className="eyebrow mb-1.5">soundtrack — MP3 or MP4 (optional)</p>
+                                <div
+                                    className={`border-2 border-dashed rounded-card p-4 text-center transition-colors ${musicFile ? 'border-brass' : 'border-rule2 hover:border-brass'}`}
+                                    onDragOver={(e) => e.preventDefault()}
+                                    onDrop={(e) => { e.stopPropagation(); handleMultiMusicDrop(e); }}
+                                >
+                                    {musicFile ? (
+                                        <div className="flex items-center justify-center gap-2 text-sm min-w-0">
+                                            {isVideoFile(musicFile)
+                                                ? <FileVideo size={16} className="shrink-0 text-ok" />
+                                                : <FileAudio size={16} className="shrink-0 text-ok" />}
+                                            <span className="truncate">{musicFile.name}</span>
+                                            <button
+                                                type="button"
+                                                onClick={() => setMusicFile(null)}
+                                                className="p-1 text-muted hover:text-ink rounded-full"
+                                                aria-label="Remove soundtrack"
+                                            >
+                                                <X size={14} />
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <label className="cursor-pointer block">
+                                            <input
+                                                type="file"
+                                                accept="audio/*,.mp3,.m4a,.wav,.mp4,.mov,.m4v"
+                                                onChange={(e) => {
+                                                    const f = e.target.files?.[0];
+                                                    setMusicFile(isSoundtrackFile(f) ? f : null);
+                                                }}
+                                                className="hidden"
+                                            />
+                                            <p className="text-ink2 lowercase text-sm">Drop an MP3 or MP4 here, or click to browse</p>
+                                        </label>
+                                    )}
+                                </div>
+                            </div>
+                            <div>
+                                <p className="eyebrow mb-1.5">soundtrack URL (optional)</p>
+                                <input
+                                    type="url"
+                                    value={musicUrl}
+                                    onChange={(e) => setMusicUrl(e.target.value)}
+                                    placeholder="https://... (if no file)"
+                                    className="input-field"
+                                    disabled={!!musicFile}
+                                />
+                                {musicFile && (
+                                    <p className="text-xs text-muted mt-1">Using uploaded audio; clear the file to use a URL instead.</p>
+                                )}
+                            </div>
+                        </div>
+                        <label className="flex items-start gap-2 text-sm text-ink2 cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={muteSource}
+                                onChange={(e) => setMuteSource(e.target.checked)}
+                                className="mt-1"
+                            />
+                            <span>
+                                Mute original video audio before merge
+                                <span className="block text-xs text-muted mt-0.5">
+                                    When off, speech from the videos is transcribed; when on, rely on the soundtrack or
+                                    visual analysis.
+                                </span>
+                            </span>
+                        </label>
+                        {multiSourceCount > 0 && (
+                            <p className="text-xs text-brass">
+                                {multiSourceCount} video source{multiSourceCount === 1 ? '' : 's'} queued
+                                {(musicUrl.trim() || musicFile) ? ' · custom soundtrack' : ''}
+                                {muteSource ? ' · video audio muted' : ''}.
+                                Merged preview appears in the player once the combine step finishes.
+                            </p>
+                        )}
+                    </div>
+                ) : mode === 'url' ? (
                     <div className="space-y-4" data-tutorial="drop-zone">
                         <div className="relative">
                             <input
@@ -267,6 +500,19 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 </p>
                             );
                         })()}
+                        <p className="text-xs text-muted pt-1">
+                            Need several clips merged for one job?{' '}
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    if (url.trim()) setMultiUrls(url.trim());
+                                    setMode('multi');
+                                }}
+                                className="text-brass hover:underline lowercase"
+                            >
+                                open multi-source →
+                            </button>
+                        </p>
                     </div>
                 ) : (
                     <div
@@ -413,7 +659,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                     onChange={(e) => setClipBrief(e.target.value)}
                                     rows={4}
                                     maxLength={4000}
-                                    placeholder="Campaign or editor notes for the AI moment picker: brands, hashtags, topics to favour or avoid (e.g. Reach × Expedia × IShowSpeed — travel/booking beats, approved on-screen branding)."
+                                    placeholder="Steer moment picking: e.g. shocking reveals, fails, funny reactions, travel beats, topics to avoid. For multi-source jobs this applies to the merged timeline."
                                     className="input-field resize-y min-h-[5rem] text-sm leading-relaxed"
                                 />
                                 <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
@@ -486,7 +732,10 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 <button
                     type="submit"
                     data-tutorial="generate"
-                    disabled={isProcessing || !acknowledged || (mode === 'url' && !url) || (mode === 'file' && (!file || fileTooShort))}
+                    disabled={isProcessing || !acknowledged
+                        || (mode === 'url' && !url)
+                        || (mode === 'multi' && multiSourceCount < 1)
+                        || (mode === 'file' && (!file || fileTooShort))}
                     className="w-full btn-primary mt-4"
                 >
                     {isProcessing ? (

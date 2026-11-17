@@ -17,3 +17,21 @@ import tempfile  # noqa: E402
 
 os.environ["YT_ACCOUNT_STATE_DIR"] = tempfile.mkdtemp(prefix="yt-account-tests-")
 os.environ.setdefault("YT_ACCOUNT_MIN_INTERVAL", "0")
+
+
+# Probes run in a thread in the suite: tests replace metering.probe_url_minutes,
+# which a pool process would not see.
+os.environ.setdefault("PROBE_PROCESSES", "0")
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_owner_cache():
+    """The owner check remembers callers per credential (cloud/owner_cache.py);
+    a caller one test remembered must not answer for the next."""
+    from cloud import owner_cache
+    owner_cache.clear()
+    yield
+    owner_cache.clear()

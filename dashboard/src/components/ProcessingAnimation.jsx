@@ -25,6 +25,11 @@ const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, s
       // cannot send the bearer header itself, hence the round trip.
       setIsYouTube(false);
       let cancelled = false;
+      // Multi-source compose stages use ?part= on the same route; serve as-is.
+      if (String(media.payload).includes('?')) {
+        setVideoSrc(getApiUrl(media.payload));
+        return undefined;
+      }
       const jobId = media.payload.split('/').pop();
       (async () => {
         try {
@@ -117,7 +122,7 @@ const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, s
           <video
             ref={videoRef}
             src={videoSrc}
-            className="w-full h-full object-cover"
+            className="w-full h-full object-contain bg-black"
             autoPlay
             muted
             loop
