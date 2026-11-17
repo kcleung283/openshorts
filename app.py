@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
@@ -670,9 +670,7 @@ async def _reserve_after_job_limit(request, user, url, input_path, job_id, max_m
         if cached is not None:
             minutes = cached
         elif url:
-            minutes = await loop.run_in_executor(
-                None, functools.partial(_metering.probe_url_minutes, url,
-                                        allow_paid=paid_allowed))
+            minutes = await _metering.run_probe(url, allow_paid=paid_allowed)
         else:
             minutes = await loop.run_in_executor(None, _metering.probe_file_minutes, input_path)
     except Exception as e:
@@ -885,11 +883,30 @@ async def _assert_job_owner(request, record):
     owner = record.get("user_id") if isinstance(record, dict) else None
     if owner is None:
         return
-    user = await _user_from_request(request)
     # Compare as strings: live jobs store a uuid.UUID, but jobs recovered from
     # the .owner sidecar store its string form — UUID != str is always True.
-    if user is None or str(user.id) != str(owner):
+    if await _owner_id_from_request(request) != str(owner):
         raise HTTPException(status_code=404, detail="Not found")
+
+
+# Who the caller of a GET is, remembered per credential for the owner check
+# alone, with a cap on how many of those lookups hold a pool connection at once
+# (cloud/owner_cache.py). A ban, a revoked key or an erased account forgets it.
+from cloud import owner_cache as _owner_cache
+
+
+async def _owner_id_from_request(request):
+    credential = (request.headers.get("Authorization", "")
+                  + "\n" + request.headers.get("X-API-Key", ""))
+    if request.method != "GET" or not credential.strip():
+        user = await _user_from_request(request)
+        return str(user.id) if user is not None else None
+    try:
+        return await _owner_cache.owner_id(credential,
+                                           lambda: _user_from_request(request))
+    except _owner_cache.Busy:
+        raise HTTPException(status_code=503, detail="Busy, retry shortly.",
+                            headers={"Retry-After": "3"})
 
 # Application State
 # PriorityQueue holds (priority, key, job_id). Lower priority dispatches first:
@@ -1935,6 +1952,32 @@ REMOTE_MAX_SECONDS = _int_env("REMOTE_MAX_SECONDS", 3600)
 REMOTE_BREAKER_FAILURES = _int_env("REMOTE_BREAKER_FAILURES", 4)
 REMOTE_BREAKER_WINDOW = 10           # ...counted over the last this many
 REMOTE_BREAKER_SECONDS = _int_env("REMOTE_BREAKER_SECONDS", 1800)
+
+
+def _quiet_minutes(spec):
+    """Minutes of the hour (UTC) given as "55-5,28-32": wrap-around ranges."""
+    out = set()
+    for part in (spec or "").split(","):
+        try:
+            a, _, b = part.strip().partition("-")
+            a, b = int(a) % 60, int(b or a) % 60
+        except ValueError:
+            continue
+        m = a
+        while True:
+            out.add(m)
+            if m == b:
+                break
+            m = (m + 1) % 60
+    return out
+
+
+# No new claim in these minutes of the hour: the worker's host also carries
+# Upload-Post, whose scheduled posts fill its link at :00-:05. A claim is a
+# ~1 GB source sent over that link a minute or two later.
+REMOTE_QUIET_MINUTES = _quiet_minutes(os.environ.get("REMOTE_QUIET_MINUTES", ""))
+# Per-transfer cap on the source sent to the worker, in Mbit/s (0: none).
+REMOTE_SOURCE_MBPS = _int_env("REMOTE_SOURCE_MBPS", 0)
 _remote_jobs: set = set()            # the subset of _running_jobs run remotely
 _remote_breaker = {"recent": [], "until": 0.0}
 
@@ -3813,6 +3856,31 @@ def _rm_under(base_dir: str, relative: str):
             pass
 
 
+def _support_ops_local_jobs(user_id) -> dict:
+    """This process's in-memory jobs of one user, for the support back-office's
+    activity view (cloud/support_ops.py): live status, why a failed one failed,
+    where its source came from. Read-only."""
+    uid = str(user_id)
+    out = {}
+    for job_id, job in list(jobs.items()):
+        if str(job.get('user_id')) != uid:
+            continue
+        status = job.get('status')
+        error = None
+        if status == 'failed':
+            try:
+                error = _job_error_text(list(job.get('logs') or []))[-500:]
+            except Exception:
+                error = None
+        out[job_id] = {
+            'status': status,
+            'error': error,
+            'source': (job.get('attestation') or {}).get('source'),
+            'created_at': job.get('submitted_at'),
+        }
+    return out
+
+
 def _purge_local_jobs_for_user(user_id) -> int:
     """Delete this user's working files and in-memory records from local disk.
 
@@ -4034,6 +4102,8 @@ async def lifespan(app: FastAPI):
         # Account erasure lives in cloud/, which can't import app.py; hand it the
         # one thing only this module can do — wipe the local working files.
         cloud.account.register_local_purge(_purge_local_jobs_for_user)
+        # The support back-office's activity view reads live job state too.
+        cloud.support_ops.register_local_jobs(_support_ops_local_jobs)
         # Same arrangement for the watermark: when a user upgrades, cloud/videos
         # re-points their clips at the clean twins in R2 and hands us each
         # one so the working copy (and an open dashboard) follows.
@@ -4096,6 +4166,9 @@ app.add_middleware(
     # they only become readable to JS once they are named here.
     expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"],
 )
+if BILLING_ENABLED:
+    # Outside CORS: the support-ops routes never answer a browser.
+    app.add_middleware(cloud.support_ops.CorsGuard)
 
 # --- Who may read /videos and /thumbnails ------------------------------------
 # A job id used to be the whole lock on a job's clips and on the untouched
@@ -4773,6 +4846,8 @@ def _claim_remote_job(worker):
         return None
     if time.time() < _remote_breaker["until"]:
         return None
+    if time.gmtime().tm_min in REMOTE_QUIET_MINUTES:
+        return None
     heap = job_queue._queue
     for entry in sorted(heap):
         prio, _key, job_id = entry
@@ -5008,7 +5083,48 @@ async def worker_source(job_id: str, request: Request):
     if not real or not any(real.startswith(r + os.sep) for r in roots) or not os.path.isfile(real):
         raise HTTPException(status_code=404, detail="Not found")
     remote_worker.touch_seen(job_dir)
-    return FileResponse(real, media_type="application/octet-stream")
+    return StreamingResponse(_source_chunks(real, job_dir), media_type="application/octet-stream",
+                             headers={"Content-Length": str(os.path.getsize(real))})
+
+
+SOURCE_CHUNK = 1024 * 1024
+# REMOTE_SOURCE_MBPS is for all transfers together: when a quiet window ends,
+# up to REMOTE_WORKER_SLOTS sources leave at once for the same link.
+_source_bucket = {"free_at": 0.0}
+_source_lock = threading.Lock()
+
+
+def _source_turn(nbytes) -> float:
+    """Seconds this chunk's sender sleeps so the sum stays under the cap."""
+    with _source_lock:
+        now = time.time()
+        start = max(now, _source_bucket["free_at"])
+        _source_bucket["free_at"] = start + nbytes * 8 / (REMOTE_SOURCE_MBPS * 1e6)
+        return max(0.0, _source_bucket["free_at"] - now)
+SOURCE_SEEN_EVERY = 10           # seconds between lease touches while sending
+
+
+def _source_chunks(path, job_dir):
+    """The source file in chunks, touching the worker's lease while it is sent.
+
+    The worker makes no other call during the download, and a source of
+    ~1 GB sent from a busy host took more than REMOTE_LEASE_SECONDS (16-nov):
+    the job was taken back mid-transfer, four of them tripped the breaker and
+    the worker sat idle while this host was the one out of CPU. A sync
+    generator: Starlette reads it in a thread, off the event loop."""
+    last = time.time()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(SOURCE_CHUNK)
+            if not chunk:
+                break
+            yield chunk
+            if REMOTE_SOURCE_MBPS:
+                time.sleep(_source_turn(len(chunk)))
+            if time.time() - last >= SOURCE_SEEN_EVERY:
+                remote_worker.touch_seen(job_dir)
+                last = time.time()
+    remote_worker.touch_seen(job_dir)
 
 
 @app.post("/internal/worker/jobs/{job_id}/log")
@@ -5403,6 +5519,10 @@ class EstimateRequest(BaseModel):
     seconds: Optional[float] = None  # a local file: the browser read its duration
 
 
+
+# The cost line under the link box waits at most this long for the probe.
+ESTIMATE_PROBE_TIMEOUT = _int_env("ESTIMATE_PROBE_TIMEOUT", 20)
+
 @app.post("/api/process/estimate")
 async def process_estimate(req: EstimateRequest, request: Request):
     """Cost line for the dashboard: what this source would cost before it runs.
@@ -5427,8 +5547,12 @@ async def process_estimate(req: EstimateRequest, request: Request):
             _check_probe_rate(f"estimate:{user.id}")
             loop = asyncio.get_event_loop()
             try:
-                minutes = await loop.run_in_executor(
-                    None, functools.partial(_metering.probe_url_minutes, url, allow_paid=False))
+                minutes = await asyncio.wait_for(
+                    _metering.run_probe(url, allow_paid=False), ESTIMATE_PROBE_TIMEOUT)
+            except asyncio.TimeoutError:
+                # Only the cost line waits on it: without a number the page
+                # says nothing, and the submit probes for itself.
+                return {"billing": True, "outcome": None}
             except Exception as e:
                 from yt_clients import NotASingleVideo
                 if isinstance(e, NotASingleVideo):
@@ -8074,7 +8198,7 @@ class SocialPostRequest(BaseModel):
     clip_index: int
     api_key: Optional[str] = None  # BYOK; ignored for managed users
     user_id: Optional[str] = None  # BYOK profile; ignored for managed users
-    platforms: List[str] # ["tiktok", "instagram", "youtube"]
+    platforms: List[str]  # social_platforms.PLATFORMS
     # Optional overrides if frontend wants to edit them
     title: Optional[str] = None
     description: Optional[str] = None
@@ -8093,18 +8217,18 @@ def _post_video_blocking(url, headers, data, file_path, filename, timeout):
         return client.post(url, headers=headers, data=data, files=files)
 
 
-# YouTube refuses a title over 100 characters; the Gemini title is not bounded.
-YOUTUBE_TITLE_MAX = 100
+import social_platforms
+from social_platforms import YOUTUBE_TITLE_MAX, youtube_title  # noqa: F401  (re-exported)
 
 
-def youtube_title(title) -> str:
-    """``title`` cut to YouTube's limit, on a word boundary when there is one."""
-    t = " ".join(str(title or "").split())
-    if len(t) <= YOUTUBE_TITLE_MAX:
-        return t
-    cut = t[:YOUTUBE_TITLE_MAX]
-    space = cut.rfind(" ")
-    return (cut[:space] if space >= YOUTUBE_TITLE_MAX // 2 else cut).rstrip(" ,.;:-")
+def _checked_platforms(platforms) -> List[str]:
+    """The request's platforms, or a 400 naming the ones OpenShorts does not post to."""
+    bad = social_platforms.unknown(platforms)
+    if bad or not platforms:
+        raise HTTPException(status_code=400, detail=(
+            f"Unsupported platform: {', '.join(map(str, bad))}. " if bad else "No platform chosen. ")
+            + f"Choose from {', '.join(social_platforms.PLATFORMS)}.")
+    return social_platforms.clean(platforms)
 
 
 # Async uploads started here, so the status proxy below only ever answers the
@@ -8166,6 +8290,7 @@ async def _check_social_post_rate(request):
 
 @app.post("/api/social/post")
 async def post_to_socials(req: SocialPostRequest, request: Request):
+    req.platforms = _checked_platforms(req.platforms)
     await _ensure_job_files(req.job_id, request)
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -8177,7 +8302,10 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         raise HTTPException(status_code=400, detail="Missing Upload-Post API key")
     post_user = resolve_post_profile(forced_profile, req.user_id)
 
-    job = jobs[req.job_id]
+    # The awaits above can let cleanup or an account delete drop the job.
+    job = jobs.get(req.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     await _assert_job_owner(request, job)
     if 'result' not in job or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
@@ -8188,7 +8316,7 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
         if stale:
             print(f"[social-post-failed] request=none platform={','.join(stale)} "
                   f"status=reauth_required message='refused before upload: reconnect needed'")
-            names = ", ".join(p.capitalize() if p != "youtube" else "YouTube" for p in stale)
+            names = ", ".join(social_platforms.label(p) for p in stale)
             raise HTTPException(status_code=409, detail=(
                 f"Reconnect {names} first: its login has expired, so the post would "
                 "fail. Use \"connect socials\" and try again."))
@@ -8231,20 +8359,10 @@ async def post_to_socials(req: SocialPostRequest, request: Request):
             if req.timezone:
                 data_payload["timezone"] = req.timezone
         
-        # Add Platform specifics
-        if "tiktok" in req.platforms:
-             data_payload["tiktok_title"] = final_description
-             data_payload["post_mode"] = TIKTOK_POST_MODE
-             
-        if "instagram" in req.platforms:
-             data_payload["instagram_title"] = final_description
-             data_payload["media_type"] = "REELS"
-
-        if "youtube" in req.platforms:
-             yt_title = req.title or clip.get('video_title_for_youtube_short', final_title)
-             data_payload["youtube_title"] = youtube_title(yt_title)
-             data_payload["youtube_description"] = final_description
-             data_payload["privacyStatus"] = "public"
+        data_payload.update(social_platforms.upload_fields(
+            req.platforms, title=final_title, description=final_description,
+            yt_title=req.title or clip.get('video_title_for_youtube_short', final_title),
+            tiktok_post_mode=TIKTOK_POST_MODE))
 
         # The upload is a blocking multipart POST of the whole clip (tens of
         # seconds for TikTok+YouTube). Run inline, it froze the event loop:
@@ -8286,7 +8404,7 @@ async def social_post_status(request_id: str, request: Request):
     upload_key, _ = await resolve_upload_post(request, None)
     if not upload_key:
         return {"status": "unknown"}
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with social_platforms.upload_post_client(20.0) as client:
         try:
             resp = await client.get("https://api.upload-post.com/api/uploadposts/status",
                                     headers={"Authorization": f"Apikey {upload_key}"},
@@ -8329,7 +8447,7 @@ def _log_post_failures(request_id, status, results):
         print(f"[social-post-failed] request={request_id} platform={r.get('platform')} "
               f"status={status} message={msg!r}")
 
-SOCIAL_PLATFORMS = ("tiktok", "instagram", "youtube")
+SOCIAL_PLATFORMS = social_platforms.PLATFORMS
 
 
 async def _managed_social_user(request, api_key, profile):
@@ -8341,7 +8459,7 @@ async def _managed_social_user(request, api_key, profile):
         user = await _user_from_request(request)
         name = cloud.social_profiles.profile_username_for(user.id)
         return {"profiles": [{"username": name, "connected": []}]}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         resp = await client.get(f"https://api.upload-post.com/api/uploadposts/users/{profile}",
                                 headers={"Authorization": f"Apikey {api_key}"})
     if resp.status_code == 404:
@@ -8372,7 +8490,7 @@ async def get_social_user(request: Request):
     print(f"🔍 Fetching User ID from: {url}")
     headers = {"Authorization": f"Apikey {api_key}"}
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         try:
             resp = await client.get(url, headers=headers)
             if resp.status_code != 200:
@@ -8398,7 +8516,7 @@ async def get_social_user(request: Request):
                              socials = p.get('social_accounts', {})
                              connected = []
                              # Check typical platforms
-                             for platform in ['tiktok', 'instagram', 'youtube']:
+                             for platform in SOCIAL_PLATFORMS:
                                  account_info = socials.get(platform)
                                  # If it's a dict and typically has data, or just not empty string
                                  if isinstance(account_info, dict):
@@ -8463,7 +8581,7 @@ async def _social_analytics_auth(request: Request, byok_profile: Optional[str]):
 
 async def _upload_post_get(api_key: str, url: str, params: dict):
     headers = {"Authorization": f"Apikey {api_key}"}
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with social_platforms.upload_post_client(60.0) as client:
         resp = await client.get(url, headers=headers, params=params)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"Vendor API Error: {resp.text}")
@@ -8667,7 +8785,7 @@ async def social_cancel_scheduled(job_id: str, request: Request, user: Optional[
         # 404 rather than 403: never confirm that someone else's job exists.
         raise HTTPException(status_code=404, detail="Scheduled post not found")
     headers = {"Authorization": f"Apikey {api_key}"}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with social_platforms.upload_post_client(30.0) as client:
         resp = await client.delete(
             f"https://api.upload-post.com/api/uploadposts/schedule/{job_id}",
             headers=headers)
@@ -8721,8 +8839,7 @@ async def _probe_thumbnail_url(request, url, user):
     paid_allowed = not await _paid_proxy_budget_exceeded()
     loop = asyncio.get_event_loop()
     try:
-        minutes = await loop.run_in_executor(
-            None, functools.partial(_metering.probe_url_minutes, url, allow_paid=paid_allowed))
+        minutes = await _metering.run_probe(url, allow_paid=paid_allowed)
     except Exception as e:
         from yt_clients import NotASingleVideo
         if isinstance(e, NotASingleVideo):
@@ -9699,6 +9816,7 @@ class SaaSPostRequest(BaseModel):
 @app.post("/api/saasshorts/post")
 async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
     """Post an AI Shorts video to social media via Upload-Post."""
+    req.platforms = _checked_platforms(req.platforms)
     if req.job_id not in saas_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -9744,16 +9862,9 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest, request: Request):
             if req.timezone:
                 data_payload["timezone"] = req.timezone
 
-        if "tiktok" in req.platforms:
-            data_payload["tiktok_title"] = final_description
-            data_payload["post_mode"] = TIKTOK_POST_MODE
-        if "instagram" in req.platforms:
-            data_payload["instagram_title"] = final_description
-            data_payload["media_type"] = "REELS"
-        if "youtube" in req.platforms:
-            data_payload["youtube_title"] = youtube_title(final_title)
-            data_payload["youtube_description"] = final_description
-            data_payload["privacyStatus"] = "public"
+        data_payload.update(social_platforms.upload_fields(
+            req.platforms, title=final_title, description=final_description,
+            tiktok_post_mode=TIKTOK_POST_MODE))
 
         filename = os.path.basename(file_path)
         print(f"📡 [AI Shorts] Sending to Upload-Post: {req.platforms}")
