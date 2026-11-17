@@ -19,6 +19,7 @@ import heapq
 import asyncio
 import signal
 import socket
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from typing import Any, Dict, Optional, List
@@ -32,6 +33,7 @@ from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 import clip_selection
 import self_host_source
+import source_compose
 import recut
 import layout_ranges
 import watermarked
@@ -5253,14 +5255,15 @@ async def _validate_source_url(url: str):
             "(youtube.com/watch?v=... or youtu.be/...)."))
 
 
-async def _quality_gate(url: str, force_low: bool):
+async def _quality_gate(url: str, force_low: bool, *, skip_short_source: bool = False):
     """Run the pre-flight probe: raises 400 for a too-short source, returns
     the needs_confirmation response for a low-resolution one, else None."""
     probe = await _probe_youtube_quality(url)
     # Hard reject, no confirm-and-retry: a too-short source fails the same
     # way on every retry, so letting the user force it just burns the job.
     source_duration = int(probe.get("duration") or 0)
-    if MIN_SOURCE_SECONDS > 0 and 0 < source_duration < MIN_SOURCE_SECONDS:
+    if (not skip_short_source and MIN_SOURCE_SECONDS > 0
+            and 0 < source_duration < MIN_SOURCE_SECONDS):
         _reject_short_source(source_duration)
     max_height = int(probe.get("max_height") or 0)
     if not force_low and QUALITY_GATE_MIN_HEIGHT > 0 \
@@ -5323,6 +5326,27 @@ def _reject_short_source(duration: float):
         f"This video is only {int(duration)}s long — clip generation needs at "
         f"least {MIN_SOURCE_SECONDS}s of material to cut from. It already is "
         f"short-form content."))
+
+
+def _compose_merge_job(
+    compose_list: List[str],
+    compose_uploads: List,
+    *,
+    music_url: Optional[str],
+    music_file: Optional[UploadFile],
+    mute_source: bool,
+) -> bool:
+    """True when the job merges multiple inputs (URLs/files/music), not one long take."""
+    n = len(compose_list) + len(compose_uploads)
+    if n < 1:
+        return False
+    return (
+        n > 1
+        or bool(compose_uploads)
+        or bool(music_url)
+        or bool(music_file and music_file.filename)
+        or mute_source
+    )
 
 
 # Layouts the caller can let the renderer choose from, mapped to the env var
@@ -5589,6 +5613,10 @@ async def process_endpoint(
     clip_min_seconds: Optional[str] = Form(None),
     clip_max_seconds: Optional[str] = Form(None),
     clip_brief: Optional[str] = Form(None),
+    video_urls: Optional[str] = Form(None),
+    music_url: Optional[str] = Form(None),
+    mute_source: Optional[str] = Form(None),
+    multi_source: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
     auto_hook_style: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
@@ -5597,6 +5625,8 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    compose_videos: List[UploadFile] = File(default=[]),
+    music_file: Optional[UploadFile] = File(default=None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -5624,6 +5654,9 @@ async def process_endpoint(
         clip_min_seconds = body.get("clip_min_seconds")
         clip_max_seconds = body.get("clip_max_seconds")
         clip_brief = body.get("clip_brief")
+        video_urls = body.get("video_urls")
+        music_url = body.get("music_url")
+        mute_source = body.get("mute_source")
         auto_hook = body.get("auto_hook")
         auto_hook_style = body.get("auto_hook_style")
         thumbnail_session_id = body.get("thumbnail_session_id")
@@ -5661,7 +5694,28 @@ async def process_endpoint(
     if upload_id and not url and not file and not thumb_session:
         upload_slot = _take_pending_upload(upload_id, await _owner_id(request))
 
-    if not url and not file and not thumb_session and not upload_slot:
+    compose_list = source_compose.parse_video_url_list(video_urls)
+    if url and not compose_list:
+        compose_list = [url.strip()]
+    elif url and compose_list and url.strip() not in compose_list:
+        compose_list = [url.strip(), *compose_list]
+    music_url = (music_url or "").strip() or None
+    mute_source_flag = str(mute_source or "").lower() in ("1", "true", "yes")
+
+    compose_uploads = [u for u in (compose_videos or []) if u.filename]
+    # Multi-source multipart: a misrouted sole `file` field still counts as compose.
+    multi_source_flag = str(multi_source or "").lower() in ("1", "true", "yes")
+    if (file and file.filename and not compose_uploads
+            and (multi_source_flag or compose_list or music_url or mute_source_flag
+                 or (music_file and music_file.filename) or video_urls)):
+        compose_uploads = [file]
+        file = None
+    compose_merge = _compose_merge_job(
+        compose_list, compose_uploads,
+        music_url=music_url, music_file=music_file, mute_source=mute_source_flag,
+    ) or multi_source_flag
+    if (not compose_list and not file and not thumb_session and not upload_slot
+            and not compose_uploads):
         raise HTTPException(status_code=400, detail="Must provide URL, File or upload_id")
 
     # Completion callback: reject unsafe targets NOW (clear 400) — delivery
@@ -5683,8 +5737,10 @@ async def process_endpoint(
     # Refuse a URL no server-side fetch may touch before anything fetches it:
     # the quality probe below used to run yt-dlp on it unvalidated (tailnet
     # hosts included) and ahead of the balance / rate checks.
-    if url:
-        await _validate_source_url(url)
+    for src_url in compose_list:
+        await _validate_source_url(src_url)
+    if music_url:
+        await _validate_source_url(music_url)
 
     # Capture attestation context for legal record (IP + timestamp + UA)
     client_ip = request.client.host if request.client else "unknown"
@@ -5698,7 +5754,11 @@ async def process_endpoint(
         "user_agent": user_agent,
         "timestamp": time.time(),
         "source": ("thumbnail_session" if thumb_session else "upload_id" if upload_slot
-                   else "url" if url else "file"),
+                   else "compose" if (len(compose_list) > 1 or compose_uploads
+                                      or music_url
+                                      or (music_file and music_file.filename)
+                                      or mute_source_flag)
+                   else "url" if compose_list else "file"),
     }
 
     job_id = str(uuid.uuid4())
@@ -5787,12 +5847,66 @@ async def process_endpoint(
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
 
+    local_video_paths: List[str] = []
+    compose_music_path = None
+    upload_limit = MAX_FILE_SIZE_MB * 1024 * 1024
+
+    async def _save_upload(uf: UploadFile, dest: str) -> None:
+        size = 0
+        with open(dest, "wb") as buffer:
+            while content := await uf.read(1024 * 1024):
+                size += len(content)
+                if size > upload_limit:
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        pass
+                    shutil.rmtree(job_output_dir, ignore_errors=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB",
+                    )
+                buffer.write(content)
+
+    for i, uf in enumerate(compose_uploads):
+        safe_name = _clamp_upload_name(
+            os.path.basename(uf.filename or "") or f"video_{i}.mp4")
+        dest = os.path.join(job_output_dir, f"compose_{i}_{safe_name}")
+        await _save_upload(uf, dest)
+        local_video_paths.append(dest)
+
+    if music_file and music_file.filename:
+        safe = _clamp_upload_name(os.path.basename(music_file.filename) or "music.mp3")
+        compose_music_path = os.path.join(job_output_dir, f"compose_music_{safe}")
+        await _save_upload(music_file, compose_music_path)
+
     input_path = None
-    if url:
-        # Keep the downloaded source inside the job dir: the clip editor's
-        # re-render path cuts new segments from it, and it ages out with the
-        # rest of the job (retention window + OUTPUT_MAX_GB cap) either way.
-        cmd.extend(["-u", url, "--keep-original"])
+    n_sources = len(compose_list) + len(local_video_paths)
+    use_compose = n_sources > 0 and (
+        n_sources > 1 or local_video_paths or music_url or compose_music_path or mute_source_flag)
+    if (compose_list or local_video_paths) and use_compose:
+        compose_path = os.path.join(job_output_dir, ".compose.json")
+        with open(compose_path, "w", encoding="utf-8") as cf:
+            json.dump({
+                "video_urls": compose_list,
+                "local_video_paths": local_video_paths,
+                "music_url": music_url,
+                "music_path": compose_music_path,
+                "mute_video": mute_source_flag,
+                "output_format": output_format or "auto",
+            }, cf)
+        cmd.extend(["--compose-spec", compose_path, "--keep-original"])
+        if local_video_paths:
+            input_path = local_video_paths[0]
+            if len(local_video_paths) > 1:
+                est = sum(_media_duration_seconds(p) for p in local_video_paths)
+                if est > 0:
+                    request.state.compose_source_seconds = est
+        if compose_list:
+            url = compose_list[0]  # metering / self-host segment planner
+    elif compose_list:
+        cmd.extend(["-u", compose_list[0], "--keep-original"])
+        url = compose_list[0]
     elif thumb_session:
         # Hardlink (or copy) the session's video under the job's name so source
         # lookup, the clip editor and the preview treat it exactly like a normal
@@ -5827,7 +5941,7 @@ async def process_endpoint(
         os.replace(src, input_path)
         pending_uploads.pop(upload_id, None)
         cmd.extend(["-i", input_path])
-    else:
+    elif file and file.filename:
         # Save uploaded file with size limit check.
         # basename() strips any path components from the client-supplied
         # filename so a name like "../../main.py" can't escape UPLOAD_DIR.
@@ -5854,6 +5968,9 @@ async def process_endpoint(
             _reject_short_source(upload_duration)
 
         cmd.extend(["-i", input_path])
+    else:
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Must provide URL, File or upload_id")
 
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
@@ -5893,7 +6010,8 @@ async def process_endpoint(
     # rejection hands the reservation back.
     if url and (QUALITY_GATE_MIN_HEIGHT > 0 or MIN_SOURCE_SECONDS > 0):
         try:
-            gate = await _quality_gate(url, force_low)
+            gate = await _quality_gate(
+                url, force_low, skip_short_source=compose_merge)
         except BaseException:
             await _drop_unstarted_job(reservation_id, job_output_dir)
             raise
@@ -6095,7 +6213,49 @@ async def get_status(job_id: str, request: Request):
     }
     if job.get('status') == 'failed':
         out["error"] = _job_error_text(list(job.get('logs') or []))[-500:]
+    previews = _compose_preview_parts(job_id)
+    if previews:
+        out["compose_previews"] = previews
+    if _locate_source(job_id):
+        out["source_preview_url"] = _signed_source_url(job_id)
     return out
+
+
+def _compose_preview_parts(job_id: str) -> List[dict]:
+    """Per-segment Live Analysis while multi-source compose is still downloading."""
+    prog = os.path.join(OUTPUT_DIR, job_id, ".compose_progress.json")
+    if not os.path.isfile(prog):
+        return []
+    try:
+        with open(prog, encoding="utf-8") as f:
+            parts = (json.load(f) or {}).get("parts") or []
+    except (json.JSONDecodeError, OSError):
+        return []
+    out: List[dict] = []
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    for p in parts:
+        name = os.path.basename(str(p.get("file") or ""))
+        if not name or not os.path.isfile(os.path.join(job_dir, name)):
+            continue
+        out.append({
+            "index": p.get("index"),
+            "title": p.get("title"),
+            "stage": p.get("stage"),
+            "file": name,
+            "url": _signed_compose_part_url(job_id, name),
+        })
+    return out
+
+
+def _signed_compose_part_url(job_id: str, basename: str) -> str:
+    base = f"/api/source/{job_id}?part={urllib.parse.quote(basename)}"
+    if not BILLING_ENABLED:
+        return base
+    exp = int(time.time()) + SOURCE_URL_TTL_SECONDS
+    msg = f"{job_id}:{basename}:{exp}"
+    secret = (_cloud_config.settings.jwt_secret if BILLING_ENABLED else "") or ""
+    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{base}&exp={exp}&sig={sig}"
 
 
 def _locate_source(job_id: str):
@@ -6105,6 +6265,9 @@ def _locate_source(job_id: str):
     the job dir (--keep-original) under the name recorded as ``source_video``
     in metadata.json. Either way it ages out with the normal retention caps.
     """
+    combined = source_compose.combined_source_path(os.path.join(OUTPUT_DIR, job_id))
+    if os.path.isfile(combined):
+        return combined
     matches = [
         f for f in glob.glob(os.path.join(UPLOAD_DIR, f"{glob.escape(job_id)}_*"))
         if not os.path.basename(f).startswith("thumb_")
@@ -6183,7 +6346,8 @@ async def get_source_url(job_id: str, request: Request):
 
 @app.get("/api/source/{job_id}")
 async def get_source_video(job_id: str, request: Request,
-                           exp: int = 0, sig: str = ""):
+                           exp: int = 0, sig: str = "",
+                           part: Optional[str] = None):
     """Stream a job's original source video for the live-analysis preview and
     the clip editor's source monitor.
 
@@ -6196,11 +6360,17 @@ async def get_source_video(job_id: str, request: Request,
     a bearer token on the request. Self-host and ownerless BYOK jobs are
     unchanged: there is no owner to check and no secret to sign with.
     """
-    signed = (
-        BILLING_ENABLED and sig
-        and exp > time.time()
-        and hmac.compare_digest(sig, _source_signature(job_id, exp))
+    part_name = os.path.basename(part or "").strip() if part else ""
+    sig_ok = (
+        BILLING_ENABLED and sig and exp > time.time()
+        and (hmac.compare_digest(sig, _source_signature(job_id, exp))
+             or (part_name and hmac.compare_digest(
+                 sig, hmac.new(
+                     (_cloud_config.settings.jwt_secret or "").encode(),
+                     f"{job_id}:{part_name}:{exp}".encode(),
+                     hashlib.sha256).hexdigest()[:32])))
     )
+    signed = sig_ok
     # Gated on BILLING_ENABLED, not just on `signed`: _job_record falls through
     # to _job_view_from_disk, which rescans the whole output directory. Off
     # billing there is no owner to find, so that scan would run on every single
@@ -6213,9 +6383,16 @@ async def get_source_video(job_id: str, request: Request,
             # The job folder can be gone (size cap, sweep) while uploads/<id>_*
             # is still there: the owner then comes from .owner / the Project row.
             await _assert_disk_job_owner(request, job_id)
-    source_path = _locate_source(job_id)
-    if not source_path:
-        raise HTTPException(status_code=404, detail="Source not found")
+    if part_name:
+        candidate = os.path.join(OUTPUT_DIR, job_id, part_name)
+        if os.path.isfile(candidate):
+            source_path = candidate
+        else:
+            raise HTTPException(status_code=404, detail="Source part not found")
+    else:
+        source_path = _locate_source(job_id)
+        if not source_path:
+            raise HTTPException(status_code=404, detail="Source not found")
     return FileResponse(source_path, media_type="video/mp4")
 
 

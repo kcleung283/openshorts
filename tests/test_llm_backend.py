@@ -120,6 +120,28 @@ def test_server_errors_surface_with_status_and_url(local, monkeypatch):
     assert "503" in str(exc.value) and "loading model" in str(exc.value)
 
 
+def test_disconnected_without_response_is_transient():
+    err = httpx.RemoteProtocolError("Server disconnected without sending a response.")
+    assert llm_backend.is_transient_error(err)
+
+
+def test_retries_local_llm_when_the_connection_drops(local, monkeypatch):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return _completion({"windows": []})
+
+    _serve(handler, monkeypatch)
+    monkeypatch.setenv("LLM_REQUEST_ATTEMPTS", "3")
+    monkeypatch.setattr(llm_backend.time, "sleep", lambda *_: None)
+    parsed, _ = llm_backend.generate_json("prompt", gemini_worker.ScoreResponse)
+    assert calls["n"] == 2
+    assert parsed == {"windows": []}
+
+
 # --- main.py routing (needs the heavy deps; skipped on minimal CI) ------------
 
 def test_stage_routes_to_local_backend_and_retries_transient(local, monkeypatch):
@@ -130,7 +152,8 @@ def test_stage_routes_to_local_backend_and_retries_transient(local, monkeypatch)
     def fake_generate(prompt, schema, model=None):
         calls["n"] += 1
         if calls["n"] == 1:
-            raise httpx.ConnectError("ConnectError: connection refused")
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response.")
         return {"windows": [{"id": "w0", "start": 0, "end": 1, "score": 50, "reason": ""}]}, {"total_cost": 0.0}
 
     monkeypatch.setattr(llm_backend, "generate_json", fake_generate)
