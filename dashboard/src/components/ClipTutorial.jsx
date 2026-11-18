@@ -16,7 +16,7 @@ const TOUR = [
   {
     target: '[data-tutorial="drop-zone"]',
     title: 'Your video',
-    body: 'Click the box or paste the link here. Keep files under 500MB.',
+    body: 'Click the box or paste the link here. Large uploads are supported (up to 10GB on self-host).',
   },
   {
     target: '[data-tutorial="output-format"]',

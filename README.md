@@ -470,7 +470,7 @@ lives in [`examples/n8n/`](examples/n8n/).
 - **Auto-Cleanup**: Old jobs are purged automatically (24h by default when self-hosted, `JOB_RETENTION_SECONDS`)
 - **Encrypted Keys**: API keys encrypted client-side, never stored server-side
 - **Upload Validation**: Image uploads validated for format and minimum size
-- **File Limits**: 2GB upload limit protection
+- **File Limits**: configurable upload cap (default 10GB via `MAX_FILE_SIZE_MB`)
 
 ---
 

@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp } from 'lucide-react';
+import { Download, Share2, AlertCircle, Loader2, Copy, Check, Wand2, Type, Calendar, Languages, FileText, Link2, Scissors, Crosshair, TrendingUp, Image, Move } from 'lucide-react';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/api';
 import { platformOptions as buildPlatformOptions, defaultPlatformFlags, flagsFromList } from '../lib/socialPlatforms';
 import { track } from '../lib/analytics';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
+import BrandLogoModal from './BrandLogoModal';
 import TranslateModal from './TranslateModal';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
@@ -87,7 +88,10 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // subtitled file (double-subtitle bug).
     const stripBurns = (filename) => {
         let f = filename || '', prev;
-        do { prev = f; f = f.replace(/^subtitled_\d+_/, '').replace(/^hooked_\d+_/, '').replace(/^hook_/, ''); } while (f !== prev);
+        do {
+            prev = f;
+            f = f.replace(/^subtitled_\d+_/, '').replace(/^hooked_\d+_/, '').replace(/^hook_/, '').replace(/^logo_\d+_/, '');
+        } while (f !== prev);
         return f;
     };
     const originalVideoUrl = getApiUrl((clip.video_url || '').replace(/[^/]+$/, stripBurns((clip.video_url || '').split('/').pop())));
@@ -232,6 +236,9 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     const [isHooking, setIsHooking] = useState(false);
     const [isTranslating, setIsTranslating] = useState(false);
     const [showHookModal, setShowHookModal] = useState(false);
+    const [showBrandLogoModal, setShowBrandLogoModal] = useState(false);
+    const [showTranslateModal, setShowTranslateModal] = useState(false);
+    const [showOverlayPlacement, setShowOverlayPlacement] = useState(false);
     const [showTranslateModal, setShowTranslateModal] = useState(false);
     const [editError, setEditError] = useState(null);
 
@@ -258,6 +265,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
     // Browser (Remotion) renders compose over the ORIGINAL clip, so using them
     // here would silently drop those burns — chain via server FFmpeg instead.
     const hasServerBurns = /(^|_)(subtitled|hook|hooked)_/.test(serverVideoFile || '');
+    const hasBurnedSubs = /(^|_)subtitled_/.test(serverVideoFile || '');
 
     // The hook currently burned into the server file (auto-hook or a manual
     // one). /api/hook REPLACES it; tracked locally so the modal stays honest
@@ -986,6 +994,18 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         {isSubtitling ? 'adding…' : 'subtitles'}
                     </button>
 
+                    {hasBurnedSubs && (
+                        <button
+                            type="button"
+                            onClick={handleRemoveSubtitles}
+                            disabled={isSubtitling}
+                            className={QUIET_BTN}
+                        >
+                            {isSubtitling ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Type size={16} className="text-muted group-hover:text-brass transition-colors shrink-0 opacity-60" />}
+                            {isSubtitling ? 'removing…' : 'remove subs'}
+                        </button>
+                    )}
+
                     <button
                         onClick={() => setShowHookModal(true)}
                         disabled={isHooking}
@@ -993,6 +1013,23 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     >
                         {isHooking ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Wand2 size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
                         {isHooking ? 'saving…' : 'edit hook'}
+                    </button>
+
+                    <button
+                        onClick={() => setShowBrandLogoModal(true)}
+                        className={QUIET_BTN}
+                    >
+                        <Image size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                        brand logo
+                    </button>
+
+                    <button
+                        type="button"
+                        onClick={() => setShowOverlayPlacement(true)}
+                        className={QUIET_BTN}
+                    >
+                        <Move size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                        track & place
                     </button>
 
                     <button
@@ -1202,6 +1239,39 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                 jobId={jobId}
                 clipIndex={index}
                 existingHook={activeLayers.hook}
+            />
+
+            <BrandLogoModal
+                open={showBrandLogoModal}
+                onClose={() => setShowBrandLogoModal(false)}
+                jobId={jobId}
+                clipIndex={index}
+                previewVideoUrl={clip.video_url}
+                onApplied={(data) => {
+                    const rel = data.video_url || data.new_video_url;
+                    if (!rel) return;
+                    const serverUrl = getApiUrl(rel);
+                    setServerVideoFile(rel.split('/').pop());
+                    setCurrentVideoUrl(serverUrl);
+                    if (videoRef.current) videoRef.current.load();
+                }}
+            />
+
+            <OverlayPlacementModal
+                open={showOverlayPlacement}
+                onClose={() => setShowOverlayPlacement(false)}
+                jobId={jobId}
+                clipIndex={index}
+                videoUrl={serverVideoFile ? `/videos/${jobId}/${serverVideoFile}` : clip.video_url}
+                serverVideoFile={serverVideoFile}
+                hookText={burnedHook || clip.viral_hook_text || ''}
+                onAppliedVideo={(data) => {
+                    const rel = data.new_video_url || data.video_url;
+                    if (!rel) return;
+                    const path = rel.startsWith('http') ? rel : getApiUrl(rel);
+                    setServerVideoFile(rel.split('/').pop());
+                    setCurrentVideoUrl(path);
+                }}
             />
 
             <HookModal

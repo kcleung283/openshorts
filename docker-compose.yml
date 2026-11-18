@@ -12,10 +12,12 @@ services:
       - SELF_HOST_SEGMENT_MINUTES=35
       # Plain URLs with no ?t=: download at most this many minutes from the start.
       - SELF_HOST_SOURCE_CAP_MINUTES=45
+      - SELF_HOST_DATA_DIR=/app/data
     volumes:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+      - ./data:/app/data
     restart: unless-stopped
 
   frontend:

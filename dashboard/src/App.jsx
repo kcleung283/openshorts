@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, Layers } from 'lucide-react';
 import KeyInput from './components/KeyInput';
+import BrandLogoSettings from './components/BrandLogoSettings';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
@@ -321,6 +322,15 @@ function App() {
       track('QueueSlowSeen', { props: { position: String(queueInfo.position) } });
     }
   }, [queueSlow, queueInfo]);
+  // Self-host: the uploaded logo is per session, not forever on disk.
+  useEffect(() => {
+    if (billingEnabled) return;
+    apiFetch('/api/brand-watermark/logo', { method: 'DELETE' })
+      .then(() => {
+        try { window.dispatchEvent(new Event('os-brand-logo-cleared')); } catch { /* ignore */ }
+      })
+      .catch(() => {});
+  }, [billingEnabled]);
   // Why the last job could not start or failed, in plain words (or '').
   const [jobError, setJobError] = useState('');
   // Durable R2 URLs (per clip index) for the current job — used as a fallback when
@@ -625,13 +635,16 @@ function App() {
   // Reopen an archived project from the History tab: the backend re-downloads
   // its files from R2 into the server's working dir and returns the full state.
   const restoreProject = async (projectJobId) => {
-    const data = await apiJson(`/api/projects/${projectJobId}/restore`, { method: 'POST' });
+    const endpoint = billingEnabled
+      ? `/api/projects/${projectJobId}/restore`
+      : `/api/self-host/reopen/${encodeURIComponent(projectJobId)}`;
+    const data = await apiJson(endpoint, { method: 'POST' });
     flushClipState();
     setProjectState(data.project_state || null);
-    setNoSource(true);
+    setNoSource(billingEnabled);
     setJobId(data.job_id);
     setResults(data.result || null);
-    setLogs(['♻️ Project restored from your library.']);
+    setLogs([billingEnabled ? '♻️ Project restored from your library.' : '♻️ Project reopened from local history.']);
     setLogTimes([Date.now() / 1000]);
     setProcessingMedia(null);
     setQualityGate(null);
@@ -856,7 +869,7 @@ function App() {
 
   // Read at failure time: the poll effect must not restart when auth settles.
   const historyAvailableRef = useRef(false);
-  historyAvailableRef.current = billingEnabled && isSignedIn;
+  historyAvailableRef.current = !billingEnabled || (billingEnabled && isSignedIn);
   const handleResetRef = useRef(null);
 
   useEffect(() => {
@@ -1237,6 +1250,9 @@ function App() {
         // but the dashboard always states the user's choice.
         auto_hook: data.autoHook ? '1' : '0',
         auto_hook_style: data.autoHook ? (data.autoHookStyle || 'pill') : null,
+        auto_brand_logo: data.autoBrandLogo ? '1' : '0',
+        captions: data.autoCaptions ? '1' : '0',
+        clip_output_english: data.englishCopy ? '1' : '0',
         // 'auto' is the server default, so only a deliberate choice travels.
         layouts: data.layout && data.layout !== 'auto' ? data.layout : null,
         // Set when the user took the quota wall's "clip the first N minutes"
@@ -1416,6 +1432,13 @@ function App() {
     setQueueInfo(null);
     setJobError('');
     localStorage.removeItem(SESSION_KEY);
+    try {
+      localStorage.setItem('os_auto_brand_logo', '0');
+    } catch { /* ignore */ }
+    apiFetch('/api/brand-watermark/logo', { method: 'DELETE' }).catch(() => {});
+    try {
+      window.dispatchEvent(new Event('os-brand-logo-cleared'));
+    } catch { /* ignore */ }
   };
   useEffect(() => {
     handleResetRef.current = handleReset;
@@ -2046,6 +2069,8 @@ function App() {
                   </div>
                 </div>
               </div>
+
+              <BrandLogoSettings />
             </div>
           )}
 

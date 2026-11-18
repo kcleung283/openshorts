@@ -227,6 +227,14 @@ def clip_brief_from_request(raw) -> str | None:
     return text[:_CLIP_BRIEF_MAX_CHARS]
 
 
+def llm_copy_language(transcript_language: str) -> str:
+    """Hooks, titles and descriptions: English when CLIP_OUTPUT_ENGLISH=1."""
+    if os.environ.get("CLIP_OUTPUT_ENGLISH", "").strip().lower() in ("1", "true", "yes"):
+        return "en"
+    lang = str(transcript_language or "unknown").split("-")[0].lower()
+    return lang if lang not in ("", "unknown", "none") else "en"
+
+
 def editor_brief_block() -> str:
     """Optional user brief for the moment-picker prompts (``CLIP_BRIEF`` env).
 

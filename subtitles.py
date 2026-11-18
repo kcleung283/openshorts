@@ -254,6 +254,19 @@ AUTO_CAPTION_STYLE = {
 }
 
 
+def auto_caption_style_for_language(language: str) -> dict:
+    """Anton + karaoke uppercase is Latin-only; non-English needs a broad font."""
+    style = dict(AUTO_CAPTION_STYLE)
+    lang = str(language or "en").split("-")[0].lower()
+    if lang in ("en", "", "unknown", "none"):
+        return style
+    style["font_name"] = "Noto Sans"
+    style["uppercase"] = False
+    style["effect"] = "none"
+    style["max_chars"] = 22
+    return style
+
+
 # Named looks for /api/subtitle `preset` (and the MCP add_subtitles tool), in
 # request-field names. Mirrors the dashboard's CAPTION_PRESETS in
 # SubtitleModal.jsx (a test checks the ids): "default" is what every clip

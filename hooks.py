@@ -484,7 +484,7 @@ def _auto_place(video_path, text, target_box_width, hook_filename, font_scale, s
 
 def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0, duration=None, style="pill",
                       also=None, font=None, layout_ranges=None, has_captions=True,
-                      mark=None):
+                      mark=None, placement_prompt=None, center_x=None, center_y=None):
     """
     Overlays text hook onto video.
     position: 'top', 'center', 'bottom', or 'auto' (hook_placement: off the
@@ -544,7 +544,32 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         img_path, box_w, box_h = create_hook_image(text, target_box_width, hook_filename, font_scale=font_scale, style=style,
                                                        font=font)
         placed = None
-        if position == "auto":
+        if center_x is not None and center_y is not None:
+            import overlay_placement
+            overlay_x, overlay_y = overlay_placement.norm_center_to_px(
+                float(center_x), float(center_y), box_w, box_h, video_width, video_height)
+        elif position == "custom":
+            overlay_x = (video_width - box_w) // 2
+            overlay_y = int(video_height * 0.20)
+        elif placement_prompt or position in (
+                "face_above", "face_on", "face_below", "face_track", "track"):
+            import hook_placement
+            import overlay_placement
+            window_end = float(duration) if duration else hook_placement.DEFAULT_WINDOW
+            sugg = overlay_placement.suggest(
+                video_path, placement_prompt or position.replace("face_", "").replace("_", " "),
+                window_end=window_end, hook_text=text, hook_font_scale=font_scale)
+            if sugg.get("hook"):
+                hc = sugg["hook"]
+                overlay_x, overlay_y = overlay_placement.norm_center_to_px(
+                    hc["center_x"], hc["center_y"],
+                    box_w, box_h, video_width, video_height)
+                placed = {"y": hc["center_y"] - box_h / video_height / 2,
+                          "scale": font_scale, "position": sugg.get("mode")}
+            else:
+                overlay_x = (video_width - box_w) // 2
+                overlay_y = int(video_height * 0.20)
+        elif position == "auto":
             placed = _auto_place(video_path, text, target_box_width, hook_filename, font_scale,
                                  style, font, video_width, video_height, duration,
                                  layout_ranges, has_captions, (box_w, box_h))
@@ -552,18 +577,17 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
                 img_path, box_w, box_h = placed["image"]
 
         # 3. Calculate Overlay Position
-        overlay_x = (video_width - box_w) // 2
-        
-        if placed:
-            overlay_y = placed["y_px"]
-        elif position == "center":
-            overlay_y = (video_height - box_h) // 2
-        elif position == "bottom":
-             # Bottom 20% mark (approx)
-             overlay_y = int(video_height * 0.70)
-        else:
-             # Top 20% mark
-             overlay_y = int(video_height * 0.20)
+        if center_x is None and center_y is None and placement_prompt is None and position not in (
+                "face_above", "face_on", "face_below", "face_track", "track", "custom"):
+            overlay_x = (video_width - box_w) // 2
+            if placed:
+                overlay_y = placed["y_px"]
+            elif position == "center":
+                overlay_y = (video_height - box_h) // 2
+            elif position == "bottom":
+                overlay_y = int(video_height * 0.70)
+            else:
+                overlay_y = int(video_height * 0.20)
         
         # 4. FFmpeg Command
         print(f"🎬 Overlaying hook: '{text}' at {overlay_x},{overlay_y}")
@@ -628,8 +652,26 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         else:
             print(f"✅ Hook added to {output_path}")
         if placed:
-            return {"position": "auto", "y": placed["y"], "scale": placed["scale"],
-                    "height": round(box_h / video_height, 3)}
+            return {
+                "position": placed.get("position") or "auto",
+                "y": placed["y"],
+                "scale": placed["scale"],
+                "height": round(box_h / video_height, 3),
+                "center_x": round(overlay_x / video_width + box_w / video_width / 2, 4),
+                "center_y": round(overlay_y / video_height + box_h / video_height / 2, 4),
+            }
+        if center_x is not None and center_y is not None:
+            return {
+                "position": "custom",
+                "center_x": round(float(center_x), 4),
+                "center_y": round(float(center_y), 4),
+            }
+        if placement_prompt:
+            return {
+                "position": "tracked",
+                "center_x": round(overlay_x / video_width + box_w / video_width / 2, 4),
+                "center_y": round(overlay_y / video_height + box_h / video_height / 2, 4),
+            }
         return True
 
     except subprocess.TimeoutExpired:

@@ -3,6 +3,7 @@ import { Link2, Upload, FileVideo, FileAudio, X, Info, Loader2, ChevronDown } fr
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
 import SourceCost from './SourceCost';
+import BrandLogoPicker from './BrandLogoPicker';
 
 const SUPPORTED_PLATFORMS = [
     'YouTube', 'Vimeo', 'TikTok', 'X / Twitter', 'Twitch', 'Kick',
@@ -14,6 +15,15 @@ const SUPPORTED_PLATFORMS = [
 // says so the moment the file is picked (a 27 s upload used to end in a bare
 // "That run failed").
 const MIN_SOURCE_SECONDS = 45;
+
+function formatUploadLimitMb(mb) {
+    if (mb == null) return '10GB';
+    if (mb >= 1024) {
+        const g = mb / 1024;
+        return Number.isInteger(g) ? `${g}GB` : `${g.toFixed(1).replace(/\.0$/, '')}GB`;
+    }
+    return `${mb}MB`;
+}
 
 const VIDEO_NAME_RE = /\.(mp4|mov|m4v|webm|mkv|avi)$/i;
 const AUDIO_NAME_RE = /\.(mp3|m4a|wav|aac|flac|ogg)$/i;
@@ -66,6 +76,7 @@ const readVideoDuration = (file) => new Promise((resolve) => {
 export default function MediaInput({ onProcess, isProcessing }) {
     const [youtubeUrlEnabled, setYoutubeUrlEnabled] = useState(true);
     const [selfHostSegmentMin, setSelfHostSegmentMin] = useState(null);
+    const [maxUploadMb, setMaxUploadMb] = useState(10240);
     // File upload is the primary path; the link is secondary.
     const [mode, setMode] = useState('file'); // 'file' | 'url' | 'multi'
     const [url, setUrl] = useState('');
@@ -100,6 +111,16 @@ export default function MediaInput({ onProcess, isProcessing }) {
         // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
         try { return localStorage.getItem('os_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
     });
+    const [autoBrandLogo, setAutoBrandLogo] = useState(() => {
+        try { return localStorage.getItem('os_auto_brand_logo') === '1'; } catch { return false; }
+    });
+    const [autoCaptions, setAutoCaptions] = useState(() => {
+        try { return localStorage.getItem('os_auto_captions') === '1'; } catch { return false; }
+    });
+    const [englishCopy, setEnglishCopy] = useState(() => {
+        try { return localStorage.getItem('os_english_copy') !== '0'; } catch { return true; }
+    });
+    const [brandLogoReady, setBrandLogoReady] = useState(false);
     // Layout: 'auto' lets the AI pick per video (server default); the others
     // force one on so a podcast host who knows what they uploaded doesn't
     // depend on the detector, and 'none' keeps the plain single crop.
@@ -142,6 +163,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 }
                 const seg = cfg?.selfHostYoutubeSegment?.minutes;
                 if (seg != null) setSelfHostSegmentMin(seg);
+                if (cfg?.maxUploadMb != null) setMaxUploadMb(cfg.maxUploadMb);
             })
             .catch(() => {});
     }, []);
@@ -170,6 +192,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
             clipMaxSeconds: clipMaxSeconds || null,
             autoHook,
             autoHookStyle,
+            autoBrandLogo: brandLogoReady && autoBrandLogo,
+            autoCaptions,
+            englishCopy,
             layout,
             clipBrief: clipBrief.trim() || null,
             sourceStart: range ? Math.round(range.start) : null,
@@ -178,6 +203,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
+            localStorage.setItem('os_auto_brand_logo', autoBrandLogo ? '1' : '0');
+            localStorage.setItem('os_auto_captions', autoCaptions ? '1' : '0');
+            localStorage.setItem('os_english_copy', englishCopy ? '1' : '0');
             localStorage.setItem('os_layout', layout);
             localStorage.setItem('os_clip_brief', clipBrief);
         } catch { /* ignore */ }
@@ -551,7 +579,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 />
                                 <Upload className="mx-auto mb-3 text-muted" size={18} />
                                 <p className="text-ink2 lowercase">Click to upload or drag and drop</p>
-                                <p className="readout mt-2">MP4, MOV up to 500MB · at least {MIN_SOURCE_SECONDS}s long</p>
+                                <p className="readout mt-2">
+                                    MP4, MOV up to {formatUploadLimitMb(maxUploadMb)} · at least {MIN_SOURCE_SECONDS}s long
+                                </p>
                             </label>
                         )}
                     </div>
@@ -601,6 +631,53 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     </div>
                 </div>
 
+                <div className="mt-5 border border-rule rounded-card p-4 space-y-4">
+                    <p className="eyebrow mb-2">Captions &amp; language</p>
+                    <label className="flex items-start gap-2 text-sm text-ink2 cursor-pointer select-none">
+                        <input
+                            type="checkbox"
+                            checked={autoCaptions}
+                            onChange={(e) => setAutoCaptions(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                        />
+                        <span>
+                            Auto-burn subtitles when clips finish
+                            <span className="block text-xs text-muted mt-0.5">
+                                Off by default. You can add or remove subtitles on each clip afterward.
+                            </span>
+                        </span>
+                    </label>
+                    <label className="flex items-start gap-2 text-sm text-ink2 cursor-pointer select-none">
+                        <input
+                            type="checkbox"
+                            checked={englishCopy}
+                            onChange={(e) => setEnglishCopy(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                        />
+                        <span>
+                            Hooks &amp; titles in English
+                            <span className="block text-xs text-muted mt-0.5">
+                                AI hooks stay English even when the video is another language.
+                            </span>
+                        </span>
+                    </label>
+                </div>
+
+                <div
+                    className="mt-5 border border-rule rounded-card p-4"
+                    data-tutorial="brand-logo"
+                    onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                    onDrop={(e) => e.stopPropagation()}
+                >
+                    <p className="eyebrow mb-2">Brand logo (optional)</p>
+                    <BrandLogoPicker
+                        showAutoApply
+                        autoApply={autoBrandLogo}
+                        onAutoApplyChange={setAutoBrandLogo}
+                        onSettingsChange={(s) => setBrandLogoReady(Boolean(s?.logo_filename))}
+                    />
+                </div>
+
                 {/* Advanced generation controls — collapsed by default; blank = AI decides */}
                 <div className="mt-4">
                     <button
@@ -610,7 +687,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(targetClips || clipMinSeconds || clipMaxSeconds || clipBrief.trim() || !autoHook) && (
+                        {(targetClips || clipMinSeconds || clipMaxSeconds || clipBrief.trim() || !autoHook
+                            || !autoCaptions || !englishCopy) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>

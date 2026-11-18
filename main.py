@@ -27,6 +27,7 @@ from google.genai import types as genai_types
 import frame_sampler
 import gpu_decode
 import gemini_worker
+import brand_watermark
 import hook_grounding
 import layout_picker
 import llm_backend
@@ -34,8 +35,8 @@ import yt_account
 import twitch_signals
 from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
-                            editor_brief_block, score_batches, shortlist_target,
-                            snap_clip_to_words, trim_to_best,
+                            editor_brief_block, llm_copy_language, score_batches,
+                            shortlist_target, snap_clip_to_words, trim_to_best,
                             vision_segments)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB)
@@ -1341,7 +1342,8 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
         return None  # silent video: nothing to caption
     try:
         import subtitles as _subs
-        style = _subs.AUTO_CAPTION_STYLE
+        style = _subs.auto_caption_style_for_language(
+            (transcript or {}).get("language"))
         output_dir = os.path.dirname(clip_path)
         stem = os.path.basename(clip_path)
         generation_id = int(time.time())
@@ -1414,6 +1416,36 @@ def auto_caption_clip(clip_path, transcript, clip_start, clip_end, split_ranges=
         print(f"   ⚠️ Auto-captions failed ({type(e).__name__}: {e}) — "
               f"delivering the clip without them.")
         return None
+
+
+def _maybe_auto_brand_logo(video_path: str, clip_index: int, clip: dict) -> str:
+    """When AUTO_BRAND_LOGO=1, burn the user's uploaded logo onto the deliverable."""
+    if os.environ.get("AUTO_BRAND_LOGO") != "1":
+        return video_path
+    settings = brand_watermark.load_settings()
+    logo = settings.get("logo_path")
+    if not logo:
+        return video_path
+    out_dir = os.path.dirname(video_path)
+    base = os.path.basename(video_path)
+    out_path = os.path.join(out_dir, f"logo_{clip_index}_{int(time.time() * 1000)}_{base}")
+    try:
+        brand_watermark.apply_brand_logo(
+            video_path, logo, out_path,
+            position=settings.get("position") or "bottom",
+            opacity=float(settings.get("opacity", brand_watermark.DEFAULT_OPACITY)),
+            width_ratio=float(settings.get("width_ratio", brand_watermark.DEFAULT_WIDTH_RATIO)),
+        )
+        clip.setdefault("active_layers", {})["brand_logo"] = {
+            "position": settings.get("position"),
+            "opacity": settings.get("opacity"),
+            "width_ratio": settings.get("width_ratio"),
+        }
+        print(f"   🏷️ Brand logo burned: {os.path.basename(out_path)}")
+        return out_path
+    except Exception as e:
+        print(f"   ⚠️ Brand logo skipped ({type(e).__name__}: {e})")
+        return video_path
 
 
 def auto_hook_clip(clip_path, clip, captions=None, mark=False):
@@ -2110,7 +2142,8 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
     stream's own viewers clipped. They are shown to both passes on the windows
     that hold them, and the hottest windows are guaranteed a shortlist slot.
     """
-    language = str(transcript_result.get('language') or 'unknown')
+    transcript_language = str(transcript_result.get('language') or 'unknown')
+    language = llm_copy_language(transcript_language)
     if llm_backend.active():
         # Self-hosted text model: no Google key needed for this stage.
         client = None
@@ -2125,7 +2158,7 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             return None
         client = genai.Client(api_key=api_key)
         model_name = os.environ.get("GEMINI_MODEL") or 'gemini-3.1-flash-lite'
-    print(f"\U0001f916  Model: {model_name} | language: {language}")
+    print(f"\U0001f916  Model: {model_name} | transcript: {transcript_language} | copy: {language}")
 
     # Full word list — ground truth for snapping cut points.
     words = []
@@ -2428,6 +2461,7 @@ def _visual_pass(client, model_name, video_path, duration, language,
 
 
 def get_visual_clips(video_path, video_duration, language="en", viewer_clips=None):
+    language = llm_copy_language(language)
     """Clip a SILENT video by vision: Gemini watches the footage and picks the
     most engaging visual moments (no transcript). Returns the same
     {"shorts", "cost_analysis"} shape as get_viral_clips, or None.
@@ -3010,6 +3044,7 @@ if __name__ == '__main__':
                                 split_ranges=split_ranges,
                                 mark=os.environ.get("WATERMARK") == "1")
                         served = captioned or deliver_path
+                        served = _maybe_auto_brand_logo(served, i, clip)
                         if os.environ.get("WATERMARK") == "1":
                             served = mark_delivery(served)
                         print(f"   ✅ Clip {i+1} ready: {clip_final_path}")

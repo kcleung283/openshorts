@@ -35,7 +35,8 @@ export default defineConfig({
       'www.openshorts.app'
     ],
     proxy: {
-      '/api': { target: backend, changeOrigin: true },
+      // Large source uploads (up to MAX_FILE_SIZE_MB) can take a long time.
+      '/api': { target: backend, changeOrigin: true, timeout: 0, proxyTimeout: 0 },
       '/videos': { target: backend, changeOrigin: true },
       '/thumbnails': { target: backend, changeOrigin: true },
       '/gallery': { target: backend, changeOrigin: true },

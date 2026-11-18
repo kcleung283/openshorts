@@ -31,7 +31,9 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Streamin
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+import brand_watermark
 import clip_selection
+import self_host_extras
 import self_host_source
 import source_compose
 import recut
@@ -53,7 +55,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "10240"))  # 10GB default; override in env
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -1558,6 +1560,78 @@ def _strip_watermark_copy(output_dir, filename):
     return filename
 
 
+# main._maybe_auto_brand_logo: logo_<clipIndex>_<ms>_<base>
+_BRAND_LOGO_MAIN_RE = re.compile(r'^logo_\d+_\d+_(.+)$')
+# /api/brand-watermark/apply: logo_<unixTs>_<base>
+_BRAND_LOGO_TS_RE = re.compile(r'^logo_\d+_(.+)$')
+
+
+def _strip_brand_logo(filename):
+    """Peel ``logo_*`` wrappers so subtitled_/hooked_ walk-backs reach real files.
+
+    The logo is burned onto whatever file is currently served (often
+    ``subtitled_<ts>_hooked_<ts>_…``). Only that ``logo_…`` encode exists on
+    disk — not a ``logo_…_hooked_…`` twin — so logo must be stripped before
+    walking other prefixes."""
+    filename = os.path.basename(filename or "")
+    while True:
+        m = _BRAND_LOGO_MAIN_RE.match(filename)
+        if m:
+            filename = m.group(1)
+            continue
+        m = _BRAND_LOGO_TS_RE.match(filename)
+        if not m:
+            return filename
+        rest = m.group(1)
+        if re.match(r'^\d+_', rest):
+            return filename
+        filename = rest
+
+
+def _filename_has_brand_logo(filename):
+    """True when the served name (or clip metadata) carries a burned brand logo."""
+    base = os.path.basename(watermarked.clean_name(filename or ""))
+    if _BRAND_LOGO_MAIN_RE.match(base):
+        return True
+    m = _BRAND_LOGO_TS_RE.match(base)
+    return bool(m and not re.match(r'^\d+_', m.group(1)))
+
+
+def _clip_had_brand_logo(clip):
+    layers = clip.get("active_layers") or {}
+    return bool(layers.get("brand_logo"))
+
+
+def _reapply_brand_logo(output_dir, clip_index, video_path, layer=None):
+    """Burn the user's logo onto a derived clip file (e.g. after removing captions)."""
+    settings = brand_watermark.load_settings()
+    logo_path = settings.get("logo_path")
+    if not logo_path or not os.path.isfile(video_path):
+        return video_path
+    layer = layer or {}
+    position = layer.get("position") or settings.get("position") or "bottom"
+    opacity = layer.get("opacity")
+    if opacity is None:
+        opacity = settings.get("opacity")
+    width_ratio = layer.get("width_ratio")
+    if width_ratio is None:
+        width_ratio = settings.get("width_ratio")
+    base = os.path.basename(video_path)
+    out_name = f"logo_{clip_index}_{int(time.time() * 1000)}_{base}"
+    out_path = os.path.join(output_dir, out_name)
+    cx = layer.get("center_x")
+    cy = layer.get("center_y")
+    brand_watermark.apply_brand_logo(
+        video_path, logo_path, out_path,
+        position=position,
+        opacity=float(opacity),
+        width_ratio=float(width_ratio),
+        center_x=cx,
+        center_y=cy,
+    )
+    return out_path
+
+
 def _strip_burned_captions(output_dir, filename, materialize=True):
     """Walk ``subtitled_<ts>_`` prefixes back to the file without burned captions.
 
@@ -1570,6 +1644,7 @@ def _strip_burned_captions(output_dir, filename, materialize=True):
     """
     import hooks
     filename = _strip_watermark_copy(output_dir, filename)
+    filename = _strip_brand_logo(filename)
     while True:
         m = re.match(r'^subtitled_\d+_(.+)$', filename)
         if not m:
@@ -1589,6 +1664,7 @@ def _strip_burned_hook(output_dir, filename):
     the name is returned unchanged when there is nothing to strip or the
     underlying file is gone."""
     filename = _strip_watermark_copy(output_dir, filename)
+    filename = _strip_brand_logo(filename)
     while True:
         m = re.match(r'^(?:hooked_\d+_|hook_)(.+)$', filename)
         if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
@@ -5215,6 +5291,7 @@ async def get_config():
             "minutes": float(self_host_source._segment_minutes()),
         },
         "selfHostExtras": not BILLING_ENABLED,
+        "maxUploadMb": MAX_FILE_SIZE_MB,
     }
 
 
@@ -5359,6 +5436,329 @@ async def self_host_mashup_suggest_beats(body: SelfHostMashupSuggestBeats):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/brand-watermark")
+async def brand_watermark_get():
+    """Saved logo + position for clip overlays (self-host and BYOK)."""
+    return brand_watermark.load_settings()
+
+
+class BrandWatermarkSettings(BaseModel):
+    position: Optional[str] = None
+    opacity: Optional[float] = None
+    width_ratio: Optional[float] = None
+
+
+@app.put("/api/brand-watermark")
+async def brand_watermark_put(body: BrandWatermarkSettings):
+    return brand_watermark.save_settings(body.model_dump(exclude_none=True))
+
+
+_LOGO_MEDIA = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+@app.get("/api/brand-watermark/preview-logo")
+async def brand_watermark_preview_logo():
+    settings = brand_watermark.load_settings()
+    path = settings.get("logo_path")
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="No logo uploaded")
+    ext = os.path.splitext(path)[1].lower()
+    revision = settings.get("logo_revision") or 0
+    return FileResponse(
+        path,
+        media_type=_LOGO_MEDIA.get(ext, "image/png"),
+        headers={
+            "Cache-Control": "no-store, max-age=0, must-revalidate",
+            "ETag": f'"{revision}"',
+        },
+    )
+
+
+@app.post("/api/brand-watermark/logo")
+async def brand_watermark_logo(file: UploadFile = File(...)):
+    data = await file.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Logo too large (max 5 MB)")
+    try:
+        return brand_watermark.store_logo_upload(file.filename or "logo.png", data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/brand-watermark/logo")
+async def brand_watermark_logo_delete():
+    """Drop the uploaded logo so a new project / refresh does not keep reusing it."""
+    return brand_watermark.clear_logo()
+
+
+class BrandWatermarkApply(BaseModel):
+    job_id: str
+    clip_index: int
+    input_filename: Optional[str] = None
+    position: Optional[str] = None
+    opacity: Optional[float] = None
+    width_ratio: Optional[float] = None
+    center_x: Optional[float] = None
+    center_y: Optional[float] = None
+    placement_prompt: Optional[str] = None
+
+
+@app.post("/api/brand-watermark/apply")
+async def brand_watermark_apply(req: BrandWatermarkApply, request: Request):
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    settings = brand_watermark.load_settings()
+    logo_path = settings.get("logo_path")
+    if not logo_path:
+        raise HTTPException(status_code=400, detail="Upload a logo in Settings or Brand logo first")
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    clips = job.get("result", {}).get("clips") or []
+    if req.clip_index < 0 or req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip = clips[req.clip_index]
+    if req.input_filename:
+        filename = os.path.basename(req.input_filename)
+    else:
+        filename = (clip.get("video_url") or "").split("/")[-1]
+    input_path = os.path.join(output_dir, filename)
+    if not os.path.isfile(input_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    clean_name = await asyncio.to_thread(_strip_burned_captions, output_dir, filename)
+    input_path = os.path.join(output_dir, clean_name)
+    filename = clean_name
+    position = req.position or settings.get("position") or "bottom"
+    opacity = req.opacity if req.opacity is not None else settings.get("opacity")
+    width_ratio = req.width_ratio if req.width_ratio is not None else settings.get("width_ratio")
+    center_x, center_y = req.center_x, req.center_y
+    if (center_x is None or center_y is None) and (req.placement_prompt or "").strip():
+        import overlay_placement
+        sugg = await asyncio.to_thread(
+            overlay_placement.suggest, input_path, req.placement_prompt,
+            logo_width_ratio=float(width_ratio))
+        if sugg.get("logo"):
+            center_x = sugg["logo"]["center_x"]
+            center_y = sugg["logo"]["center_y"]
+            position = "custom"
+    if center_x is not None and center_y is not None:
+        position = "custom"
+    out_name = f"logo_{int(time.time())}_{filename}"
+    out_path = os.path.join(output_dir, out_name)
+
+    def _run():
+        brand_watermark.apply_brand_logo(
+            input_path, logo_path, out_path,
+            position=position, opacity=float(opacity), width_ratio=float(width_ratio),
+            center_x=center_x, center_y=center_y)
+
+    try:
+        await asyncio.to_thread(_run)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    out_name = await _deliver(request, req.job_id, out_name)
+    rel = f"/videos/{req.job_id}/{out_name}"
+    clip["video_url"] = rel
+    layer = {
+        "position": position, "opacity": opacity, "width_ratio": width_ratio,
+    }
+    if center_x is not None and center_y is not None:
+        layer["center_x"] = center_x
+        layer["center_y"] = center_y
+    clip.setdefault("active_layers", {})["brand_logo"] = layer
+    jobs[req.job_id]["result"]["clips"][req.clip_index] = clip
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if json_files:
+        try:
+            with open(json_files[0], encoding="utf-8") as f:
+                data = json.load(f)
+            shorts = data.get("shorts") or []
+            if req.clip_index < len(shorts):
+                shorts[req.clip_index] = {**shorts[req.clip_index], **clip}
+                data["shorts"] = shorts
+                write_json_atomic(json_files[0], data, indent=4)
+        except Exception as e:
+            print(f"⚠️ brand-watermark metadata: {e}")
+    _archive_clip_edit_bg(req.job_id, req.clip_index, out_name)
+    return {"video_url": rel, "filename": out_name, "clip_index": req.clip_index}
+
+
+_horizontal_preview_locks: Dict[str, threading.Lock] = {}
+_horizontal_preview_locks_guard = threading.Lock()
+
+
+def _ensure_horizontal_clip_preview(
+    output_dir: str, clip_index: int, source_path: str, segments: list,
+) -> Optional[str]:
+    """Uncropped horizontal cut of the clip for face analysis (not the 9:16 deliverable)."""
+    preview_name = f"temp_preview_{clip_index}.mp4"
+    preview_path = os.path.join(output_dir, preview_name)
+    lock_key = f"{output_dir}:{clip_index}"
+    with _horizontal_preview_locks_guard:
+        lock = _horizontal_preview_locks.setdefault(lock_key, threading.Lock())
+    with lock:
+        if os.path.isfile(preview_path) and os.path.getsize(preview_path) > 1000:
+            return preview_path
+    work_token = f"{clip_index}_{uuid.uuid4().hex[:8]}"
+    work_path = None
+    try:
+        with lock:
+            if os.path.isfile(preview_path) and os.path.getsize(preview_path) > 1000:
+                return preview_path
+            work_path = _clip_scene_workfile(source_path, segments, output_dir, work_token)
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", work_path,
+                 "-vf", "scale=640:-2", "-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", "30", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+                 preview_path],
+                check=True, timeout=600,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except Exception as exc:
+        detail = exc
+        if isinstance(exc, subprocess.CalledProcessError):
+            tail = (exc.stderr or b"").decode(errors="replace")[-200:]
+            detail = f"ffmpeg: {tail or exc}"
+        print(f"Horizontal preview for overlay placement failed: {detail}")
+        if os.path.isfile(preview_path):
+            try:
+                os.remove(preview_path)
+            except OSError:
+                pass
+        return None
+    finally:
+        if work_path and os.path.exists(work_path):
+            os.remove(work_path)
+    return preview_path if os.path.isfile(preview_path) else None
+
+
+class OverlayPlacementSuggest(BaseModel):
+    job_id: str
+    clip_index: int
+    input_filename: Optional[str] = None
+    prompt: Optional[str] = ""
+    hook_prompt: Optional[str] = None
+    logo_prompt: Optional[str] = None
+    hook_face_id: Optional[int] = None
+    logo_face_id: Optional[int] = None
+    hook_text: Optional[str] = None
+    hook_size: Optional[str] = "M"
+    hook_center_x: Optional[float] = None
+    hook_center_y: Optional[float] = None
+    logo_center_x: Optional[float] = None
+    logo_center_y: Optional[float] = None
+    target: Optional[str] = "hook"
+    face_overrides: Optional[List[Dict[str, Any]]] = None
+
+
+@app.post("/api/overlay-placement/suggest")
+async def overlay_placement_suggest(req: OverlayPlacementSuggest, request: Request):
+    """Suggest hook/logo positions from a prompt + face detection (for the drag UI)."""
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, jobs[req.job_id])
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    clips = jobs[req.job_id].get("result", {}).get("clips") or []
+    if req.clip_index < 0 or req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    meta = {}
+    if json_files:
+        with open(json_files[0], encoding="utf-8") as f:
+            meta = json.load(f)
+    clip = clips[req.clip_index]
+    shorts = meta.get("shorts") or clips
+    clip_meta = shorts[req.clip_index] if req.clip_index < len(shorts) else clip
+    filename = os.path.basename(
+        req.input_filename or (clip.get("video_url") or "").split("/")[-1])
+    if not os.path.isfile(os.path.join(output_dir, filename)):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    deliverable_path = await asyncio.to_thread(
+        _strip_burned_captions, output_dir, filename, False)
+    deliverable_path = os.path.join(output_dir, deliverable_path)
+
+    analysis_path = deliverable_path
+    analysis_url = f"/videos/{req.job_id}/{os.path.basename(deliverable_path)}"
+    if meta.get("output_format") != "horizontal":
+        source_path = _locate_source(req.job_id)
+        if source_path:
+            segments, _ = _clip_recipe_parts(clip_meta)
+            preview = await asyncio.to_thread(
+                _ensure_horizontal_clip_preview,
+                output_dir, req.clip_index, source_path, segments)
+            if preview:
+                analysis_path = preview
+                analysis_url = f"/videos/{req.job_id}/{os.path.basename(preview)}"
+
+    settings = brand_watermark.load_settings()
+    size_map = {"S": 0.8, "M": 1.0, "L": 1.3}
+    hook_scale = size_map.get(req.hook_size or "M", 1.0)
+    text = (req.hook_text or clip.get("viral_hook_text") or "Hook").strip()
+    hook_center = None
+    if req.hook_center_x is not None and req.hook_center_y is not None:
+        hook_center = (float(req.hook_center_x), float(req.hook_center_y))
+    logo_center = None
+    if req.logo_center_x is not None and req.logo_center_y is not None:
+        logo_center = (float(req.logo_center_x), float(req.logo_center_y))
+    import overlay_placement
+    try:
+        out = await asyncio.to_thread(
+            overlay_placement.suggest, analysis_path, req.prompt,
+            hook_text=text, hook_font_scale=hook_scale,
+            logo_width_ratio=float(settings.get("width_ratio") or 0.22),
+            hook_prompt=req.hook_prompt,
+            logo_prompt=req.logo_prompt,
+            hook_face_id=req.hook_face_id,
+            logo_face_id=req.logo_face_id,
+            deliverable_path=deliverable_path,
+            hook_center=hook_center,
+            logo_center=logo_center,
+            target=req.target or "hook",
+            face_overrides=req.face_overrides)
+    except Exception as e:
+        print(f"overlay-placement suggest failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Face placement failed: {type(e).__name__}: {e}")
+    out["analysis_video_url"] = analysis_url
+    out["deliverable_video_url"] = (
+        f"/videos/{req.job_id}/{os.path.basename(deliverable_path)}")
+    return out
+
+
+@app.post("/api/self-host/reopen/{job_id}")
+async def self_host_reopen(job_id: str):
+    """Reload a finished local job so clip editor / overlays work (MP4, URL, compose)."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not _JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job id")
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    meta = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+    if not meta:
+        raise HTTPException(status_code=404, detail="Project not found on disk")
+    if job_id not in jobs:
+        _recover_jobs_from_disk()
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Could not load project")
+    job = jobs[job_id]
+    title = os.path.basename(meta[0]).replace("_metadata.json", "")
+    return {
+        "job_id": job_id,
+        "status": job.get("status", "completed"),
+        "result": job.get("result"),
+        "project_state": None,
+        "title": title,
+    }
 
 
 if not BILLING_ENABLED:
@@ -5870,6 +6270,8 @@ async def process_endpoint(
     multi_source: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
     auto_hook_style: Optional[str] = Form(None),
+    auto_brand_logo: Optional[str] = Form(None),
+    clip_output_english: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
@@ -5910,6 +6312,8 @@ async def process_endpoint(
         mute_source = body.get("mute_source")
         auto_hook = body.get("auto_hook")
         auto_hook_style = body.get("auto_hook_style")
+        auto_brand_logo = body.get("auto_brand_logo")
+        clip_output_english = body.get("clip_output_english")
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
         upload_id = body.get("upload_id")
@@ -6051,6 +6455,13 @@ async def process_endpoint(
             env["AUTO_HOOK_STYLE"] = auto_hook_style
         print(f"[auto-hook] job={job_id} style={env.get('AUTO_HOOK_STYLE', 'classic')}")
 
+    if str(auto_brand_logo).lower() in ("1", "true", "yes"):
+        if brand_watermark.load_settings().get("logo_path"):
+            env["AUTO_BRAND_LOGO"] = "1"
+            print(f"[auto-brand-logo] job={job_id}")
+        else:
+            print(f"[auto-brand-logo] job={job_id} skipped (no logo uploaded)")
+
     # Manual generation controls (discussion #65): optional clip-count target
     # and duration band, forwarded to the selection prompts via the same env
     # overrides the A/B harness already reads (clip_selection.py). All three
@@ -6091,12 +6502,23 @@ async def process_endpoint(
         env["CLIP_BRIEF"] = brief
         print(f"[gen-controls] job={job_id} clip_brief={len(brief)} chars")
 
-    # captions=false: the source already carries burned-in subtitles (or the
-    # caller adds its own later), so skip the free auto-caption pass instead
-    # of stacking a second layer. Absent → the deployment default (on).
-    if captions is not None and str(captions).lower() in ("0", "false", "no"):
-        env["AUTO_CAPTIONS"] = "0"
-        print(f"[captions] job={job_id} auto-captions off")
+    # captions=false: skip burned-in word subtitles on every clip (user toggle
+    # or API). Explicit true keeps them on even if a deploy default changes.
+    if captions is not None:
+        if str(captions).lower() in ("0", "false", "no"):
+            env["AUTO_CAPTIONS"] = "0"
+            print(f"[captions] job={job_id} auto-captions off")
+        elif str(captions).lower() in ("1", "true", "yes"):
+            env["AUTO_CAPTIONS"] = "1"
+            print(f"[captions] job={job_id} auto-captions on")
+
+    if clip_output_english is not None:
+        if str(clip_output_english).lower() in ("1", "true", "yes"):
+            env["CLIP_OUTPUT_ENGLISH"] = "1"
+            print(f"[copy-lang] job={job_id} hooks/titles in English")
+        else:
+            env["CLIP_OUTPUT_ENGLISH"] = "0"
+            print(f"[copy-lang] job={job_id} hooks/titles follow transcript language")
 
     local_video_paths: List[str] = []
     compose_music_path = None
@@ -6891,6 +7313,10 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
     if job_id in jobs and glob.glob(os.path.join(job_dir, "*_metadata.json")):
         return True
     if not BILLING_ENABLED:
+        if glob.glob(os.path.join(job_dir, "*_metadata.json")):
+            if job_id not in jobs:
+                _recover_jobs_from_disk()
+            return job_id in jobs
         return False
     try:
         await restore_project(job_id, request)
@@ -7500,11 +7926,17 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             "duration": total,
             "render_path": "fast" if fast else "source",
         }
+    except recut.RecutError as e:
+        if reservation_id:
+            await _metering.release_reservation(reservation_id)
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         if reservation_id:
             await _metering.release_reservation(reservation_id)
         print(f"❌ Rerender Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e) or "re-render failed")
 
 
 # --- Manual framing -----------------------------------------------------------
@@ -8336,6 +8768,12 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
         or f"{os.path.basename(json_files[0]).replace('_metadata.json', '')}"
            f"_clip_{req.clip_index + 1}.mp4")
 
+    clip_meta = clips[req.clip_index]
+    had_brand = (
+        _filename_has_brand_logo(filename)
+        or _clip_had_brand_logo(clip_meta))
+    brand_layer = (clip_meta.get("active_layers") or {}).get("brand_logo")
+
     # Same walk-back the burn path uses, so this undoes any number of restyles.
     filename = await asyncio.to_thread(_strip_burned_captions, output_dir, filename)
 
@@ -8343,18 +8781,34 @@ async def remove_subtitles(req: RemoveSubtitlesRequest, request: Request):
         raise HTTPException(status_code=404,
                             detail="The original clip is no longer available.")
 
+    # The logo wrapper is peeled to find the caption-free file; put the logo back
+    # when the clip had one (same idea as _reapply_captions on /api/hook).
+    if had_brand:
+        bare = os.path.join(output_dir, filename)
+        try:
+            bare = await asyncio.to_thread(
+                _reapply_brand_logo, output_dir, req.clip_index, bare, brand_layer)
+            filename = os.path.basename(bare)
+        except Exception as e:
+            print(f"⚠️ Brand logo re-apply after subtitle remove: {e}")
+
     # Free plan: the un-captioned file is served through its wm_ copy, which
     # is reused when the clip shipped that way (no encode).
     filename = await _deliver(request, req.job_id, filename)
     new_url = f"/videos/{req.job_id}/{filename}"
     if req.clip_index < len(job.get('result', {}).get('clips', [])):
         job['result']['clips'][req.clip_index]['video_url'] = new_url
+    layers = clips[req.clip_index].setdefault("active_layers", {})
+    layers["subtitles"] = None
     try:
         clips[req.clip_index]['video_url'] = new_url
         data['shorts'] = clips
         write_json_atomic(json_files[0], data, indent=4)
     except Exception as e:
         print(f"⚠️ Failed to update metadata.json: {e}")
+
+    if req.clip_index < len(job.get('result', {}).get('clips', [])):
+        job['result']['clips'][req.clip_index].setdefault("active_layers", {})["subtitles"] = None
 
     _archive_clip_edit_bg(req.job_id, req.clip_index, filename)
     return {"success": True, "new_video_url": new_url}
@@ -8373,6 +8827,9 @@ class HookRequest(BaseModel):
     style: Optional[str] = "pill"  # pill/classic/dark/yellow/red/outline/outline_yellow
     font: Optional[str] = None  # montserrat/anton/serif (hooks.HOOK_FONTS); None = the style's own
     remove: Optional[bool] = False  # strip the burned hook instead of adding one
+    placement_prompt: Optional[str] = None
+    center_x: Optional[float] = None
+    center_y: Optional[float] = None
 
 @app.post("/api/hook")
 async def add_hook(req: HookRequest, request: Request):
@@ -8425,6 +8882,7 @@ async def add_hook(req: HookRequest, request: Request):
     filename = clean_name
     input_path = os.path.join(output_dir, clean_name)
 
+    placement_info = None
     if req.remove:
         # Nothing to burn: the hook-less file is the target; captions (if the
         # clip had them) go back on below.
@@ -8451,10 +8909,12 @@ async def add_hook(req: HookRequest, request: Request):
                     input_path, req.text, output_path, position=req.position or "auto",
                     font_scale=font_scale, duration=req.duration_seconds, style=req.style,
                     font=req.font, layout_ranges=clip_data.get('layout_ranges'),
-                    has_captions=had_captions)
+                    has_captions=had_captions,
+                    placement_prompt=req.placement_prompt,
+                    center_x=req.center_x, center_y=req.center_y)
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, run_hook)
+            placement_info = await loop.run_in_executor(None, run_hook)
 
         except Exception as e:
             print(f"❌ Hook Error: {e}")
@@ -8483,6 +8943,15 @@ async def add_hook(req: HookRequest, request: Request):
             "text": req.text, "style": req.style, "font": req.font, "position": req.position,
             "duration_seconds": req.duration_seconds,
         }
+        if isinstance(placement_info, dict):
+            for k in ("center_x", "center_y", "y", "scale"):
+                if placement_info.get(k) is not None:
+                    clip_data["auto_hook"][k] = placement_info[k]
+        if req.placement_prompt:
+            clip_data["auto_hook"]["placement_prompt"] = req.placement_prompt
+        if req.center_x is not None:
+            clip_data["auto_hook"]["center_x"] = req.center_x
+            clip_data["auto_hook"]["center_y"] = req.center_y
 
     # Update Persistence (Same logic as subtitles)
     # Update InMemory Jobs

@@ -157,7 +157,9 @@ def reground(clip_path, clip, transcript, start, end) -> Optional[dict]:
         frames = frames_at(clip_path, times)
         if not frames:
             return None
-        language = str((transcript or {}).get("language") or "unknown")
+        import clip_selection
+        transcript_language = str((transcript or {}).get("language") or "unknown")
+        language = clip_selection.llm_copy_language(transcript_language)
         prompt = gemini_worker.GROUNDED_HOOK_PROMPT.format(
             language=language,
             current_hook=clip.get("viral_hook_text") or "",
